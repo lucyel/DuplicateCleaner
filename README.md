@@ -51,11 +51,15 @@ Checked files stay selected when switching tabs. The selection count and recycli
 
 ### Filtering duplicate groups
 
-Use **Filename**, **File path**, and **Folder path** above the results for case-insensitive text matches. Folder path searches the file's parent path, without its filename. Enter optional inclusive minimum and maximum **File size** values in B, KiB, MiB, or GiB; decimals are accepted and blank bounds mean no limit. For an exact size, use the same minimum and maximum.
+Click the **magnifying-glass icon** beside the theme icon to show the filters; they are hidden on launch. Click it again to hide the panel while keeping the applied filters. Use **Filename**, **File path**, and **Folder path** above the results for case-insensitive text matches. Folder path searches the file's parent path, without its filename. Enter optional inclusive minimum and maximum **File size** values in B, KiB, MiB, or GiB; decimals are accepted and blank bounds mean no limit. For an exact size, use the same minimum and maximum.
 
 Click **Apply** or press Enter in a field. A group is shown when at least one file meets every filled criterion. Its other copies remain available for comparison and selection; existing file-type tabs still restrict which file rows are shown. **Clear filters** removes these criteria. Invalid sizes leave the previous filter unchanged. Filters use scan-time metadata, do not change files, and are not saved in session files.
 
 Filtering preserves checked files, including files in hidden groups. The selection count and recycling confirmation report hidden checks. Use **Clear file selection** to uncheck files across all groups and filters.
+
+A group containing checked files has an amber highlight and a checkmark beside its title, even when collapsed. The marker disappears when the group's last checked file is unchecked. This follows selections made in either the list or the preview.
+
+The top summary shows the number of currently visible groups and their potentially recoverable size. These totals update when applying or clearing filters or switching tabs. Recovery estimates include all copies in each matching group, even when a file-type tab hides some copies.
 
 Folder selection is additive: it keeps files already checked elsewhere and includes matching results hidden in other file-type tabs. It selects only verified duplicates in the exact parent folder, not unique files or duplicates in subfolders. The status line reports how many new files were checked and how many selected files from that folder are hidden by the current tab. Run the command again safely if needed; no file is recycled until you use the normal recycling confirmation.
 

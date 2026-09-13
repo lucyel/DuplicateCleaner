@@ -9,7 +9,9 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMessageBox, QStyle, QStyleOptionViewItem
 
 from duplicate_cleaner.gui import MainWindow
+from duplicate_cleaner.models import RecycleResult, ScanResult
 from duplicate_cleaner.scanner import scan
+from duplicate_cleaner.sessions import LoadResult, SessionData
 from tests.support import FileTestCase
 
 
@@ -66,15 +68,18 @@ class ResultControlTests(FileTestCase):
         self.window.apply_filter_button.click()
         self.assertEqual(len(self.visible_groups()), 1)
         self.assertEqual(self.window.visible_paths, {self.cat, self.cat_copy})
+        self.assertEqual(self.window.summary.text(), "1 duplicate group  ·  1.00 KiB potentially recoverable")
         self.window.folder_path_filter.setText("BACKUP")
         self.window.apply_filter_button.click()
         self.assertEqual(self.visible_groups(), [])
+        self.assertEqual(self.window.summary.text(), "0 duplicate groups  ·  0 B potentially recoverable")
         self.window.filename_filter.setText("cat-copy")
         self.window.file_path_filter.setText(str(self.cat_copy).replace("\\", "/").upper())
         self.window.apply_filter_button.click()
         self.assertEqual(self.window.visible_paths, {self.cat, self.cat_copy})
         self.window.clear_filter_button.click()
         self.assertEqual(len(self.visible_groups()), 3)
+        self.assertEqual(self.window.summary.text(), "3 duplicate groups  ·  3.00 KiB potentially recoverable")
 
     def test_folder_filter_uses_parent_path_not_filename(self):
         self.window.folder_path_filter.setText("Cat.jpg")
@@ -139,6 +144,7 @@ class ResultControlTests(FileTestCase):
         self.window.type_tabs.setCurrentIndex(3)  # Images
         self.assertEqual(self.window.type_tabs.tabText(3), "Images")
         self.assertEqual(self.window.visible_paths, {self.cat})
+        self.assertEqual(self.window.summary.text(), "1 duplicate group  ·  1.00 KiB potentially recoverable")
         parent, gallery = self.show_gallery()
         copy_index = next(i for i, record in enumerate(gallery.files) if record.path == self.cat_copy)
         gallery.item(copy_index).setCheckState(Qt.CheckState.Checked)
@@ -147,6 +153,38 @@ class ResultControlTests(FileTestCase):
         self.window.clear_selection()
         self.assertEqual(self.visible_groups(), [])
         self.assertEqual(gallery.count(), 0)
+
+    def test_summary_stays_filtered_after_rescan_and_cleanup(self):
+        self.window.filename_filter.setText("cat")
+        self.window.apply_filter_button.click()
+        self.window.on_scan(scan([self.root]))
+        self.assertEqual(self.window.summary.text(), "1 duplicate group  ·  1.00 KiB potentially recoverable")
+        with patch.object(QMessageBox, "exec", return_value=0):
+            self.window.on_recycled(RecycleResult(recycled=[self.cat_copy]))
+        self.assertEqual(self.window.summary.text(), "0 duplicate groups remaining  ·  0 B potentially recoverable")
+        self.window.clear_filter_button.click()
+        self.assertEqual(self.window.summary.text(), "2 duplicate groups remaining  ·  2.00 KiB potentially recoverable")
+
+    def test_loaded_summary_uses_filters_and_status_messages_survive_filter_changes(self):
+        self.window.filename_filter.setText("cat")
+        self.window.apply_filter_button.click()
+        data = SessionData(tuple(self.window.groups), frozenset(), (str(self.root),),
+                           True, (), 6, 6144, "All", "2026-09-13T00:00:00+07:00")
+
+        def accept(dialog):
+            dialog.defaultButton().click()
+            return 0
+
+        with patch.object(QMessageBox, "exec", accept):
+            self.window.on_session_loaded(LoadResult(self.root / "saved.dupsession", data))
+        self.assertEqual(self.window.summary.text(), "Loaded 1 duplicate group  ·  1.00 KiB potentially recoverable")
+        with patch.object(QMessageBox, "critical"):
+            self.window.on_failure("Test failure")
+        self.window.clear_filter_button.click()
+        self.assertEqual(self.window.summary.text(), "Operation stopped · results may be out of date")
+        self.window.on_scan(ScanResult(cancelled=True))
+        self.window.apply_filter_button.click()
+        self.assertEqual(self.window.summary.text(), "Scan cancelled — no files changed")
 
     def test_gallery_checkbox_click_syncs_collapsed_tree_and_clear_selection(self):
         self.window.resize(1500, 1100)
@@ -164,16 +202,21 @@ class ResultControlTests(FileTestCase):
         QTest.mouseClick(gallery.viewport(), Qt.MouseButton.LeftButton, pos=checkbox.center())
         self.assertEqual(self.window.selected, {record.path})
         self.assertFalse(parent.isExpanded())
+        self.assertFalse(parent.icon(0).isNull())
+        self.assertNotEqual(parent.background(0).style(), Qt.BrushStyle.NoBrush)
         tree_item = next(child for child in self.window.file_items()
                          if child.data(0, Qt.ItemDataRole.UserRole).path == record.path)
         self.assertEqual(tree_item.checkState(0), Qt.CheckState.Checked)
         tree_item.setCheckState(0, Qt.CheckState.Unchecked)
         self.assertEqual(item.checkState(), Qt.CheckState.Unchecked)
+        self.assertTrue(parent.icon(0).isNull())
+        self.assertEqual(parent.background(0).style(), Qt.BrushStyle.NoBrush)
         item.setCheckState(Qt.CheckState.Checked)
         item.setText("Thumbnail label refreshed")
         self.assertEqual(self.window.selected, {record.path})
         self.window.clear_selection()
         self.assertEqual(item.checkState(), Qt.CheckState.Unchecked)
+        self.assertTrue(parent.icon(0).isNull())
 
     def test_pair_checkboxes_follow_file_chooser_and_list_selection(self):
         parent = self.group_item(self.cat)
@@ -214,6 +257,8 @@ class ResultControlTests(FileTestCase):
     def test_controls_render_in_both_themes_at_minimum_window_size(self):
         self.window.show()
         self.window.resize(940, 720)
+        self.assertTrue(self.window.filter_panel.isHidden())
+        self.window.filter_toggle.click()
         self.window.filename_filter.setText("cat")
         self.window.apply_filter_button.click()
         self.show_gallery()
@@ -229,3 +274,10 @@ class ResultControlTests(FileTestCase):
         self.window.resize(1220, 1000)
         self.app.processEvents()
         self.assertTrue(self.window.grab().save(str(self.root.parent / "result-controls-wide.png")))
+        visible_paths = set(self.window.visible_paths)
+        self.window.filter_toggle.click()
+        self.assertTrue(self.window.filter_panel.isHidden())
+        self.assertEqual(self.window.visible_paths, visible_paths)
+        self.assertEqual(self.window.filter_toggle.accessibleName(), "Show filters")
+        self.app.processEvents()
+        self.assertTrue(self.window.grab().save(str(self.root.parent / "filters-hidden.png")))

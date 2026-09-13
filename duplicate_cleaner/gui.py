@@ -6,7 +6,7 @@ from pathlib import Path
 from threading import Event
 
 from PySide6.QtCore import QFileInfo, QRectF, QSettings, QSize, Qt, QThread, QUrl, Signal
-from PySide6.QtGui import QCloseEvent, QColor, QDesktopServices, QFont, QIcon, QPainter, QPalette, QPixmap, QTextOption
+from PySide6.QtGui import QBrush, QCloseEvent, QColor, QDesktopServices, QFont, QIcon, QPainter, QPalette, QPixmap, QTextOption
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
@@ -65,11 +65,13 @@ QPushButton { background: white; border: 1px solid #ccd5e2; border-radius: 7px;
 QFrame#sidebar QPushButton { padding: 6px 10px; }
 QPushButton:hover { background: #eaf0f8; border-color: #8aa7cc; }
 QPushButton:pressed { background: #dce7f6; }
-QToolButton#sidebarToggle, QToolButton#themeToggle {
+QToolButton#sidebarToggle, QToolButton#themeToggle, QToolButton#filterToggle {
     background: transparent; border: none; border-radius: 6px;
 }
-QToolButton#sidebarToggle:hover, QToolButton#themeToggle:hover { background: #e0ebff; }
-QToolButton#sidebarToggle:focus, QToolButton#themeToggle:focus { border: 1px solid #60a5fa; }
+QToolButton#sidebarToggle:hover, QToolButton#themeToggle:hover,
+QToolButton#filterToggle:hover, QToolButton#filterToggle:checked { background: #e0ebff; }
+QToolButton#sidebarToggle:focus, QToolButton#themeToggle:focus,
+QToolButton#filterToggle:focus { border: 1px solid #60a5fa; }
 QPushButton#primary { background: #2563eb; border-color: #2563eb; color: white; }
 QPushButton#primary:hover { background: #1d4ed8; }
 QPushButton:disabled { background: #edf0f4; border-color: #e0e5eb; color: #9aa5b4; }
@@ -105,7 +107,8 @@ QLabel#summary { background: #1e293b; border-color: #334155; }
 QPushButton { background: #243247; border-color: #475569; }
 QPushButton:hover { background: #334155; border-color: #94a3b8; }
 QPushButton:pressed { background: #3c4e68; }
-QToolButton#sidebarToggle:hover, QToolButton#themeToggle:hover { background: #334155; }
+QToolButton#sidebarToggle:hover, QToolButton#themeToggle:hover,
+QToolButton#filterToggle:hover, QToolButton#filterToggle:checked { background: #334155; }
 QPushButton:disabled, QPushButton#primary:disabled {
     background: #1a2536; border-color: #334155; color: #7f8da3;
 }
@@ -167,6 +170,8 @@ def control_icon(kind: str, dark: bool) -> QIcon:
         "sun": '<circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2'
                'M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5"/>',
         "moon": '<path d="M20.5 14A9 9 0 0 1 10 3.5 9 9 0 1 0 20.5 14Z"/>',
+        "search": '<circle cx="10.5" cy="10.5" r="6.5"/><path d="m15.5 15.5 5 5"/>',
+        "checked": '<circle cx="12" cy="12" r="9"/><path d="m7.5 12 3 3 6-6"/>',
         "sidebar": '<rect x="3" y="4" width="18" height="16" rx="3"/>'
                    '<path d="M9 4v16M6 8v8"/>',
     }
@@ -237,6 +242,8 @@ class MainWindow(QMainWindow):
         self.selected: set[Path] = set()
         self.visible_paths: set[Path] = set()
         self.result_filters = {}
+        self.summary_notice = "Ready to scan"
+        self.summary_context = ""
         self.records: dict[Path, FileRecord] = {}
         self.issues = []
         self._changing_checks = False
@@ -264,6 +271,15 @@ class MainWindow(QMainWindow):
         titles.addWidget(subtitle)
         heading.addLayout(titles)
         heading.addStretch()
+        self.filter_toggle = QToolButton()
+        self.filter_toggle.setObjectName("filterToggle")
+        self.filter_toggle.setFixedSize(36, 36)
+        self.filter_toggle.setIconSize(QSize(24, 24))
+        self.filter_toggle.setCheckable(True)
+        self.filter_toggle.setToolTip("Show filters")
+        self.filter_toggle.setAccessibleName("Show filters")
+        self.filter_toggle.toggled.connect(self.toggle_filters)
+        heading.addWidget(self.filter_toggle, 0, Qt.AlignmentFlag.AlignVCenter)
         self.dark_mode = QToolButton()
         self.dark_mode.setObjectName("themeToggle")
         self.dark_mode.setFixedSize(36, 36)
@@ -462,6 +478,7 @@ class MainWindow(QMainWindow):
         filter_layout.addWidget(self.filter_error, 3, 0, 1, 3)
         # Keep filters accessible even when the results/preview need horizontal scrolling.
         duplicate_layout.insertWidget(0, self.filter_panel)
+        self.filter_panel.hide()
         self.filter_hint = QLabel()
         self.filter_hint.setObjectName("hint")
         self.filter_hint.setWordWrap(True)
@@ -666,6 +683,7 @@ class MainWindow(QMainWindow):
     def change_theme(self, dark):
         apply_theme(dark)
         self.update_control_icons()
+        self.update_group_highlights()
         self.settings.setValue("appearance/dark_mode", dark)
 
     def update_control_icons(self):
@@ -675,6 +693,16 @@ class MainWindow(QMainWindow):
         self.dark_mode.setToolTip(label)
         self.dark_mode.setAccessibleName(label)
         self.sidebar_toggle.setIcon(control_icon("sidebar", dark))
+        self.filter_toggle.setIcon(control_icon("search", dark))
+
+    def toggle_filters(self, visible):
+        self.filter_panel.setVisible(visible)
+        label = "Hide filters" if visible else "Show filters"
+        self.filter_toggle.setToolTip(label)
+        self.filter_toggle.setAccessibleName(label)
+        if visible:
+            self.workflow_tabs.setCurrentIndex(0)
+            self.filename_filter.setFocus()
 
     def add_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Choose a folder to scan")
@@ -821,13 +849,15 @@ class MainWindow(QMainWindow):
         selected_view = category == "Selected"
         self.visible_paths.clear()
         visible_groups = 0
+        visible_savings = 0
         self.tree.setUpdatesEnabled(False)
         sorting = self.tree.isSortingEnabled()
         labels = []
         try:
             for index in range(self.tree.topLevelItemCount()):
                 parent = self.tree.topLevelItem(index)
-                group_matches = self.group_matches_filters(parent.data(0, Qt.ItemDataRole.UserRole))
+                group = parent.data(0, Qt.ItemDataRole.UserRole)
+                group_matches = self.group_matches_filters(group)
                 group_selected = selected_view and any(
                     parent.child(child_index).data(0, Qt.ItemDataRole.UserRole).path in self.selected
                     for child_index in range(parent.childCount())
@@ -844,6 +874,7 @@ class MainWindow(QMainWindow):
                 parent.setHidden(visible == 0)
                 if visible:
                     visible_groups += 1
+                    visible_savings += group.extra_bytes
                 label = ("" if visible == parent.childCount() else
                          f"{visible} of {parent.childCount()} files shown")
                 if parent.text(1) != label:
@@ -862,6 +893,16 @@ class MainWindow(QMainWindow):
             if labels:
                 self.tree.setSortingEnabled(sorting)
             self.tree.setUpdatesEnabled(True)
+        if self.summary_notice is not None:
+            self.summary.setText(self.summary_notice)
+        else:
+            noun = "group" if visible_groups == 1 else "groups"
+            heading = f"{visible_groups:,} duplicate {noun}"
+            if self.summary_context == "loaded":
+                heading = "Loaded " + heading
+            elif self.summary_context == "remaining":
+                heading += " remaining"
+            self.summary.setText(f"{heading}  ·  {format_bytes(visible_savings)} potentially recoverable")
         if self.result_filters:
             self.filter_hint.setText(
                 f"{visible_groups:,} of {len(self.groups):,} duplicate groups shown · filters applied. "
@@ -881,6 +922,7 @@ class MainWindow(QMainWindow):
         else:
             self.filter_hint.setText(f"No duplicate files in {category}. Choose All to see other file types.")
         self.filter_hint.setVisible(bool(self.result_filters) or (category != "All" and bool(self.groups)))
+        self.update_group_highlights()
         self.update_actions()
         self.update_details()
 
@@ -888,8 +930,25 @@ class MainWindow(QMainWindow):
         if self.type_tabs.tabText(self.type_tabs.currentIndex()) == "Selected":
             self.filter_results()
         else:
+            self.update_group_highlights()
             self.update_actions()
             self.update_details()
+
+    def update_group_highlights(self):
+        dark = self.dark_mode.isChecked()
+        highlight = QBrush(QColor("#3b3520" if dark else "#fff1c2"))
+        checked_icon = control_icon("checked", dark)
+        for index in range(self.tree.topLevelItemCount()):
+            parent = self.tree.topLevelItem(index)
+            group = parent.data(0, Qt.ItemDataRole.UserRole)
+            checked = sum(record.path in self.selected for record in group.files)
+            for column in range(self.tree.columnCount()):
+                parent.setBackground(column, highlight if checked else QBrush())
+            # The marker remains visible when the current-row color covers the highlight.
+            parent.setIcon(0, checked_icon if checked else QIcon())
+            description = f"{checked} of {len(group.files)} files selected for recycling" if checked else ""
+            parent.setData(0, Qt.ItemDataRole.AccessibleDescriptionRole, description)
+            parent.setToolTip(0, f"Full SHA-256: {group.digest}" + (f"\n{description}" if checked else ""))
 
     def start_job(self, job, handler, error_handler=None):
         self.thumbnails.clear()
@@ -913,9 +972,9 @@ class MainWindow(QMainWindow):
         self.session_path = None
         self.scan_file_count = 0
         self.scan_total_bytes = 0
+        self.summary_notice = "Scanning your folders…"
         self.set_groups([])
         self.issues = []
-        self.summary.setText("Scanning your folders…")
         self.empty.setText("Checking size → samples → SHA-256 → every byte. No files will be changed.")
         self.start_job(lambda **kwargs: scan(roots, recursive, excluded_folders=exclusions, **kwargs),
                        self.on_scan)
@@ -1041,6 +1100,8 @@ class MainWindow(QMainWindow):
         for folder in data.excluded_folders:
             self.add_excluded_folder_path(folder)
         self.recursive.setChecked(data.recursive)
+        self.summary_notice = None
+        self.summary_context = "loaded"
         self.set_groups(data.groups)
         if restore_checks:
             self._changing_checks = True
@@ -1059,10 +1120,6 @@ class MainWindow(QMainWindow):
                           if self.type_tabs.tabText(index) == tab_name), 0)
         self.type_tabs.setCurrentIndex(tab_index)
         self.filter_results()
-        savings = sum(group.extra_bytes for group in self.groups)
-        noun = "group" if len(self.groups) == 1 else "groups"
-        self.summary.setText(
-            f"Loaded {len(self.groups):,} duplicate {noun} · {format_bytes(savings)} potentially recoverable")
         self.empty.setText(
             "No usable duplicate groups remain in this session. Changed or missing files are listed under errors.")
         action = f"{len(data.selected):,} saved checks restored" if restore_checks else "all files left unchecked"
@@ -1280,14 +1337,12 @@ class MainWindow(QMainWindow):
         self.scan_file_count = result.file_count
         self.scan_total_bytes = result.total_bytes
         self.session_available = not result.cancelled
+        self.summary_notice = "Scan cancelled — no files changed" if result.cancelled else None
+        self.summary_context = ""
         self.set_groups(result.groups)
-        savings = sum(group.extra_bytes for group in result.groups)
         if result.cancelled:
-            self.summary.setText("Scan cancelled — no files changed")
             self.empty.setText("Start another scan when you are ready. Partial results are not used for cleanup.")
         else:
-            noun = "group" if len(result.groups) == 1 else "groups"
-            self.summary.setText(f"{len(result.groups):,} duplicate {noun}  ·  {format_bytes(savings)} potentially recoverable")
             self.empty.setText("No verified duplicates found. Check skipped files / errors for anything we could not inspect.")
         self.status.setText(f"{'Cancelled' if result.cancelled else 'Scan complete'}  ·  "
                             f"{result.file_count:,} files discovered  ·  {format_bytes(result.total_bytes)}  ·  "
@@ -1470,10 +1525,9 @@ class MainWindow(QMainWindow):
             remaining_files = tuple(record for record in group.files if record.path not in recycled)
             if len(remaining_files) > 1:
                 remaining_groups.append(DuplicateGroup(remaining_files, group.digest))
+        self.summary_notice = None
+        self.summary_context = "remaining"
         self.set_groups(remaining_groups)
-        savings = sum(group.extra_bytes for group in self.groups)
-        noun = "group" if len(self.groups) == 1 else "groups"
-        self.summary.setText(f"{len(self.groups):,} duplicate {noun} remaining  ·  {format_bytes(savings)} potentially recoverable")
         self.empty.setText("No duplicate groups remain in these results. Groups with fewer than two copies are no longer listed. Scan again to check for new duplicates.")
         self.status.setText("Cleanup cancelled; already recycled files remain in the Recycle Bin."
                             if result.cancelled else "Cleanup complete. No permanent deletion was requested.")
@@ -1488,8 +1542,8 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def on_failure(self, message):
+        self.summary_notice = "Operation stopped · results may be out of date" if self.groups else "Operation stopped"
         self.set_groups(self.groups)
-        self.summary.setText("Operation stopped · results may be out of date" if self.groups else "Operation stopped")
         self.empty.setText("Scan again before continuing. If cleanup was running, check the Recycle Bin for files already moved.")
         self.status.setText(message)
         details = message
