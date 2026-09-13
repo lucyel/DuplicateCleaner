@@ -1,0 +1,1575 @@
+import os
+import re
+from datetime import datetime
+from decimal import Decimal
+from pathlib import Path
+from threading import Event
+
+from PySide6.QtCore import QFileInfo, QRectF, QSettings, QSize, Qt, QThread, QUrl, Signal
+from PySide6.QtGui import QCloseEvent, QColor, QDesktopServices, QFont, QIcon, QPainter, QPalette, QPixmap, QTextOption
+from PySide6.QtSvg import QSvgRenderer
+from PySide6.QtWidgets import (
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+    QFileDialog, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
+    QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
+    QSplitter, QStyle, QStyleOptionViewItem, QTabBar, QTabWidget, QTreeWidget, QTreeWidgetItem,
+    QToolButton, QVBoxLayout, QWidget,
+)
+
+from .cleanup import recycle_selected
+from .empty_folders import (EmptyFolderRecord, EmptyFolderRecycleResult, EmptyFolderScanResult,
+                            ensure_empty_folder_current, recycle_empty_folders, scan_empty_folders)
+from .files import ensure_current
+from .models import DuplicateGroup, FileRecord, Progress, RecycleResult, ScanResult, format_bytes
+from .preview import ComparisonPreview
+from .scanner import scan
+from .sessions import (LoadResult, SaveResult, SessionData, load_session as load_session_file,
+                       save_session as save_session_file)
+from .thumbnails import ThumbnailController
+
+
+FILE_TYPES = {
+    "Videos": {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".webm", ".m4v", ".mpg", ".mpeg",
+               ".ts", ".mts", ".m2ts", ".flv", ".vob", ".3gp", ".ogv"},
+    "Images": {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tif", ".tiff", ".heic",
+               ".heif", ".avif", ".ico", ".svg", ".raw", ".cr2", ".cr3", ".nef", ".arw", ".dng", ".psd"},
+    "Archives": {".zip", ".zipx", ".7z", ".rar", ".tar", ".gz", ".bz2", ".xz", ".tgz",
+                 ".tbz2", ".txz", ".zst", ".cab", ".iso"},
+    "Documents": {".pdf", ".doc", ".docx", ".docm", ".odt", ".rtf", ".txt", ".md",
+                  ".xls", ".xlsx", ".xlsm", ".ods", ".csv", ".ppt", ".pptx", ".pptm",
+                  ".odp", ".epub", ".mobi"},
+    "Audio": {".mp3", ".wav", ".flac", ".aac", ".m4a", ".ogg", ".opus", ".wma", ".aiff",
+              ".aif", ".alac", ".ape", ".mid", ".midi"},
+}
+
+
+def file_type(path: Path) -> str:
+    extension = path.suffix.casefold()
+    return next((name for name, extensions in FILE_TYPES.items() if extension in extensions), "Other")
+
+
+STYLE = """
+QMainWindow, QDialog { background: #f4f6f9; }
+QWidget { color: #25334a; font-family: 'Segoe UI'; font-size: 10pt; }
+QFrame#sidebar { background: #17253b; border-radius: 12px; }
+QFrame#sidebar QLabel, QFrame#sidebar QCheckBox { color: #e2e9f4; }
+QLabel#title { font-size: 24pt; font-weight: 700; color: #162940; }
+QLabel#subtitle, QLabel#hint { color: #64748b; }
+QLabel#filterError { color: #b91c1c; }
+QLineEdit, QComboBox { background: white; border: 1px solid #ccd5e2; border-radius: 5px; padding: 5px; }
+QLabel#section { font-size: 12pt; font-weight: 600; }
+QLabel#summary { background: white; border: 1px solid #e0e6ef; border-radius: 10px;
+                  padding: 16px; font-size: 12pt; font-weight: 600; }
+QPushButton { background: white; border: 1px solid #ccd5e2; border-radius: 7px;
+              padding: 9px 14px; font-weight: 600; }
+QFrame#sidebar QPushButton { padding: 6px 10px; }
+QPushButton:hover { background: #eaf0f8; border-color: #8aa7cc; }
+QPushButton:pressed { background: #dce7f6; }
+QToolButton#sidebarToggle, QToolButton#themeToggle {
+    background: transparent; border: none; border-radius: 6px;
+}
+QToolButton#sidebarToggle:hover, QToolButton#themeToggle:hover { background: #e0ebff; }
+QToolButton#sidebarToggle:focus, QToolButton#themeToggle:focus { border: 1px solid #60a5fa; }
+QPushButton#primary { background: #2563eb; border-color: #2563eb; color: white; }
+QPushButton#primary:hover { background: #1d4ed8; }
+QPushButton:disabled { background: #edf0f4; border-color: #e0e5eb; color: #9aa5b4; }
+QPushButton#primary:disabled { background: #edf0f4; border-color: #e0e5eb; color: #9aa5b4; }
+QTreeWidget, QListWidget, QPlainTextEdit { background: white; border: 1px solid #dce3ed;
+                                        border-radius: 8px; padding: 5px; }
+QTreeWidget { alternate-background-color: #f8fafc; }
+QTreeWidget::item { padding: 8px 4px; }
+QTreeWidget::item:selected { background: #e0ebff; color: #14305c; }
+QTreeWidget::indicator, QListWidget::indicator { width: 17px; height: 17px; }
+QTabBar::tab { background: #edf2f8; padding: 8px; border-bottom: 2px solid transparent; }
+QTabBar::tab:hover { background: #e0ebff; }
+QTabBar::tab:selected { background: white; color: #1d4ed8; border-bottom-color: #2563eb; }
+QHeaderView::section { background: #edf2f8; color: #4a5f7c; border: none;
+                       padding: 12px 8px; font-weight: 600; }
+QProgressBar { background: #e3e9f2; border: none; border-radius: 4px; min-height: 8px; }
+QProgressBar::chunk { background: #2563eb; border-radius: 4px; }
+QCheckBox { spacing: 8px; }
+QSplitter::handle { background: transparent; width: 16px; }
+QFrame#thumbnailPopup { background: white; border: 1px solid #b9c8dc; border-radius: 8px; }
+QToolTip { background: white; color: #25334a; border: 1px solid #b9c8dc; padding: 5px; }
+"""
+
+DARK_STYLE = """
+QMainWindow, QDialog { background: #111827; }
+QWidget { color: #e2e8f0; }
+QFrame#sidebar { background: #0b1220; }
+QLabel#title { color: #f1f5f9; }
+QLabel#subtitle, QLabel#hint { color: #a5b4c8; }
+QLabel#filterError { color: #fca5a5; }
+QLineEdit, QComboBox { background: #172235; border-color: #475569; }
+QLabel#summary { background: #1e293b; border-color: #334155; }
+QPushButton { background: #243247; border-color: #475569; }
+QPushButton:hover { background: #334155; border-color: #94a3b8; }
+QPushButton:pressed { background: #3c4e68; }
+QToolButton#sidebarToggle:hover, QToolButton#themeToggle:hover { background: #334155; }
+QPushButton:disabled, QPushButton#primary:disabled {
+    background: #1a2536; border-color: #334155; color: #7f8da3;
+}
+QTreeWidget, QListWidget, QPlainTextEdit { background: #172235; border-color: #334155; }
+QTreeWidget { alternate-background-color: #1b293e; }
+QTreeWidget::item:selected, QListWidget::item:selected { background: #264b78; color: #f1f5f9; }
+QTabBar::tab { background: #243247; }
+QTabBar::tab:hover { background: #334155; }
+QTabBar::tab:selected { background: #172235; color: #93c5fd; border-bottom-color: #60a5fa; }
+QTreeWidget::indicator:unchecked, QListWidget::indicator:unchecked, QCheckBox::indicator:unchecked {
+    background: #111827; border: 1px solid #7f8da3; border-radius: 2px;
+}
+QTreeWidget::indicator:unchecked:hover, QListWidget::indicator:unchecked:hover, QCheckBox::indicator:unchecked:hover {
+    background: #243247; border-color: #bfdbfe;
+}
+QHeaderView::section { background: #243247; color: #cbd5e1; }
+QProgressBar { background: #243247; }
+QFrame#thumbnailPopup { background: #1e293b; border-color: #475569; }
+QToolTip { background: #1e293b; color: #e2e8f0; border-color: #475569; }
+"""
+
+
+def apply_theme(dark: bool):
+    app = QApplication.instance()
+    palette = app.style().standardPalette()
+    if dark:
+        # The palette also covers controls drawn by Qt, such as scrollbars and checkboxes.
+        colors = {
+            QPalette.ColorRole.Window: "#111827",
+            QPalette.ColorRole.WindowText: "#e2e8f0",
+            QPalette.ColorRole.Base: "#172235",
+            QPalette.ColorRole.AlternateBase: "#1b293e",
+            QPalette.ColorRole.Text: "#e2e8f0",
+            QPalette.ColorRole.Button: "#243247",
+            QPalette.ColorRole.ButtonText: "#e2e8f0",
+            QPalette.ColorRole.Highlight: "#264b78",
+            QPalette.ColorRole.HighlightedText: "#f1f5f9",
+            QPalette.ColorRole.ToolTipBase: "#1e293b",
+            QPalette.ColorRole.ToolTipText: "#e2e8f0",
+            QPalette.ColorRole.Link: "#93c5fd",
+            QPalette.ColorRole.PlaceholderText: "#a5b4c8",
+            QPalette.ColorRole.Light: "#475569",
+            QPalette.ColorRole.Midlight: "#334155",
+            QPalette.ColorRole.Mid: "#243247",
+            QPalette.ColorRole.Dark: "#0b1220",
+            QPalette.ColorRole.Shadow: "#070d18",
+        }
+        for role, color in colors.items():
+            palette.setColor(role, QColor(color))
+        for role in (QPalette.ColorRole.WindowText, QPalette.ColorRole.Text, QPalette.ColorRole.ButtonText):
+            palette.setColor(QPalette.ColorGroup.Disabled, role, QColor("#7f8da3"))
+    app.setPalette(palette)
+    app.setStyleSheet(STYLE + (DARK_STYLE if dark else ""))
+
+
+def control_icon(kind: str, dark: bool) -> QIcon:
+    color = "#e2e8f0" if dark else "#25334a"
+    shapes = {
+        "sun": '<circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2'
+               'M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5"/>',
+        "moon": '<path d="M20.5 14A9 9 0 0 1 10 3.5 9 9 0 1 0 20.5 14Z"/>',
+        "sidebar": '<rect x="3" y="4" width="18" height="16" rx="3"/>'
+                   '<path d="M9 4v16M6 8v8"/>',
+    }
+    svg = (f'<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" '
+           f'fill="none" stroke="{color}" stroke-width="1.7" stroke-linecap="round" '
+           f'stroke-linejoin="round">{shapes[kind]}</svg>')
+    pixmap = QPixmap(48, 48)
+    pixmap.setDevicePixelRatio(2)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    QSvgRenderer(svg.encode()).render(painter, QRectF(0, 0, 24, 24))
+    painter.end()
+    return QIcon(pixmap)
+
+
+class Worker(QThread):
+    progress = Signal(object)
+    outcome = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, job, parent=None):
+        super().__init__(parent)
+        self.job = job
+        self.cancel_event = Event()
+
+    def run(self):
+        try:
+            result = self.job(cancel=self.cancel_event, progress=self.progress.emit)
+            self.outcome.emit(result)
+        except Exception as exc:
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+
+
+class ResultItem(QTreeWidgetItem):
+    def __lt__(self, other):
+        column = self.treeWidget().sortColumn()
+        if column == 2:
+            return self.data(2, Qt.ItemDataRole.UserRole) < other.data(2, Qt.ItemDataRole.UserRole)
+        return self.text(column).casefold() < other.text(column).casefold()
+
+
+class ResultTree(QTreeWidget):
+    def mouseDoubleClickEvent(self, event):
+        index = self.indexAt(event.position().toPoint())
+        if index.isValid() and index.data(Qt.ItemDataRole.CheckStateRole) is not None:
+            option = QStyleOptionViewItem()
+            option.initFrom(self)
+            option.rect = self.visualRect(index)
+            option.features |= QStyleOptionViewItem.ViewItemFeature.HasCheckIndicator
+            checkbox = self.style().subElementRect(QStyle.SubElement.SE_ItemViewItemCheckIndicator,
+                                                    option, self)
+            if checkbox.contains(event.position().toPoint()):
+                return
+        super().mouseDoubleClickEvent(event)
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.settings = QSettings("DuplicateCleaner", "DuplicateCleaner")
+        dark = self.settings.value("appearance/dark_mode", False, type=bool)
+        apply_theme(dark)
+        self.setWindowTitle("Duplicate Cleaner")
+        self.resize(1220, 800)
+        self.setMinimumSize(940, 720)
+        self.worker = None
+        self.groups: list[DuplicateGroup] = []
+        self.selected: set[Path] = set()
+        self.visible_paths: set[Path] = set()
+        self.result_filters = {}
+        self.records: dict[Path, FileRecord] = {}
+        self.issues = []
+        self._changing_checks = False
+        self.session_available = False
+        self.session_path: Path | None = None
+        self.scan_file_count = 0
+        self.scan_total_bytes = 0
+        self.empty_folders: list[EmptyFolderRecord] = []
+        self.selected_empty_folders: set[Path] = set()
+        self.empty_folder_issues = []
+        self._changing_empty_checks = False
+
+        container = QWidget()
+        self.setCentralWidget(container)
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(24, 22, 24, 20)
+        layout.setSpacing(16)
+        heading = QHBoxLayout()
+        titles = QVBoxLayout()
+        title = QLabel("Duplicate Cleaner")
+        title.setObjectName("title")
+        titles.addWidget(title)
+        subtitle = QLabel("Find identical files. Choose the copies you want to recycle.")
+        subtitle.setObjectName("subtitle")
+        titles.addWidget(subtitle)
+        heading.addLayout(titles)
+        heading.addStretch()
+        self.dark_mode = QToolButton()
+        self.dark_mode.setObjectName("themeToggle")
+        self.dark_mode.setFixedSize(36, 36)
+        self.dark_mode.setIconSize(QSize(24, 24))
+        self.dark_mode.setCheckable(True)
+        self.dark_mode.setChecked(dark)
+        self.dark_mode.toggled.connect(self.change_theme)
+        heading.addWidget(self.dark_mode, 0, Qt.AlignmentFlag.AlignVCenter)
+        layout.addLayout(heading)
+
+        splitter = QSplitter()
+        self.main_splitter = splitter
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(18)
+        layout.addWidget(splitter, 1)
+        self.sidebar_container = QWidget()
+        sidebar_row = QHBoxLayout(self.sidebar_container)
+        sidebar_row.setContentsMargins(0, 0, 0, 0)
+        sidebar_row.setSpacing(4)
+        sidebar = QFrame()
+        self.sidebar = sidebar
+        sidebar.setObjectName("sidebar")
+        sidebar.setMinimumWidth(230)
+        side = QVBoxLayout(sidebar)
+        side.setContentsMargins(18, 16, 18, 16)
+        side.setSpacing(6)
+        section = QLabel("Choose folders")
+        section.setObjectName("section")
+        side.addWidget(section)
+        self.folders = QListWidget()
+        self.folders.setToolTip("Add one or more folders. Files are compared within and across them.")
+        self.folders.setMinimumHeight(60)
+        self.folders.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        side.addWidget(self.folders, 1)
+        self.add_button = QPushButton("+ Add folder")
+        self.remove_button = QPushButton("Remove selected folders")
+        self.add_button.clicked.connect(self.add_folder)
+        self.remove_button.clicked.connect(self.remove_folders)
+        side.addWidget(self.add_button)
+        side.addWidget(self.remove_button)
+        excluded_label = QLabel("Excluded subfolders")
+        excluded_label.setObjectName("section")
+        side.addWidget(excluded_label)
+        self.excluded_folders = QListWidget()
+        self.excluded_folders.setAccessibleName("Excluded subfolders")
+        self.excluded_folders.setToolTip(
+            "These subfolders and everything inside them are skipped by both scans. "
+            "Changes apply to the next scan.")
+        self.excluded_folders.setMinimumHeight(60)
+        self.excluded_folders.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.excluded_folders.itemSelectionChanged.connect(self.update_actions)
+        side.addWidget(self.excluded_folders, 1)
+        exclusion_actions = QHBoxLayout()
+        self.exclude_button = QPushButton("+ Exclude…")
+        self.exclude_button.setToolTip("Choose a subfolder of an added scan folder to skip.")
+        self.exclude_button.clicked.connect(self.choose_excluded_folder)
+        self.remove_exclusion_button = QPushButton("Remove")
+        self.remove_exclusion_button.setToolTip("Include the selected excluded subfolders in future scans.")
+        self.remove_exclusion_button.clicked.connect(self.remove_exclusions)
+        exclusion_actions.addWidget(self.exclude_button)
+        exclusion_actions.addWidget(self.remove_exclusion_button)
+        side.addLayout(exclusion_actions)
+        self.recursive = QCheckBox("Include subfolders")
+        self.recursive.setChecked(True)
+        side.addWidget(self.recursive)
+        self.scan_button = QPushButton("Scan for duplicates")
+        self.scan_button.setToolTip("Scanning never changes files. Links and unsafe files are skipped.")
+        self.scan_button.setObjectName("primary")
+        self.scan_button.clicked.connect(self.start_scan)
+        side.addWidget(self.scan_button)
+        self.save_session_button = QPushButton("Save session…")
+        self.save_session_button.setToolTip("Save these results and checked files so you can continue later.")
+        self.save_session_button.clicked.connect(self.save_session)
+        side.addWidget(self.save_session_button)
+        self.load_session_button = QPushButton("Load session…")
+        self.load_session_button.setToolTip("Load saved results without scanning file contents again.")
+        self.load_session_button.clicked.connect(self.load_session)
+        side.addWidget(self.load_session_button)
+        sidebar_row.addWidget(sidebar)
+        self.sidebar_toggle = QToolButton()
+        self.sidebar_toggle.setObjectName("sidebarToggle")
+        self.sidebar_toggle.setFixedSize(28, 32)
+        self.sidebar_toggle.setIconSize(QSize(20, 20))
+        self.sidebar_toggle.setToolTip("Hide sidebar")
+        self.sidebar_toggle.setAccessibleName("Hide sidebar")
+        self.sidebar_toggle.setCheckable(True)
+        self.sidebar_toggle.setChecked(True)
+        self.sidebar_toggle.toggled.connect(self.toggle_sidebar)
+        self.update_control_icons()
+        sidebar_row.addWidget(self.sidebar_toggle, 0, Qt.AlignmentFlag.AlignTop)
+        splitter.addWidget(self.sidebar_container)
+
+        main = QWidget()
+        main_content = QVBoxLayout(main)
+        main_content.setContentsMargins(0, 0, 0, 0)
+        self.workflow_tabs = QTabWidget()
+        self.workflow_tabs.setAccessibleName("Cleaner tools")
+        main_content.addWidget(self.workflow_tabs)
+        duplicate_page = QWidget()
+        content = QVBoxLayout(duplicate_page)
+        content.setContentsMargins(12, 12, 12, 12)
+        content.setSpacing(12)
+        duplicate_scroll = QScrollArea()
+        duplicate_scroll.setWidgetResizable(True)
+        duplicate_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        duplicate_scroll.setWidget(duplicate_page)
+        duplicate_container = QWidget()
+        duplicate_layout = QVBoxLayout(duplicate_container)
+        duplicate_layout.setContentsMargins(0, 0, 0, 0)
+        duplicate_layout.setSpacing(0)
+        duplicate_layout.addWidget(duplicate_scroll, 1)
+        self.workflow_tabs.addTab(duplicate_container, "Duplicate files")
+        self.summary = QLabel("Ready to scan")
+        self.summary.setObjectName("summary")
+        self.summary.setWordWrap(True)
+        content.addWidget(self.summary)
+        results_heading = QHBoxLayout()
+        section = QLabel("Review identical files")
+        section.setObjectName("section")
+        results_heading.addWidget(section)
+        results_heading.addStretch()
+        self.preview_toggle = QPushButton("Hide preview")
+        self.preview_toggle.setCheckable(True)
+        self.preview_toggle.setChecked(True)
+        self.preview_toggle.toggled.connect(self.update_details)
+        results_heading.addWidget(self.preview_toggle)
+        self.open_button = QPushButton("Open file location")
+        self.open_button.clicked.connect(self.open_folder)
+        results_heading.addWidget(self.open_button)
+        content.addLayout(results_heading)
+        self.type_tabs = QTabBar()
+        self.type_tabs.setAccessibleName("Filter duplicate results")
+        self.type_tabs.setExpanding(False)
+        self.type_tabs.setUsesScrollButtons(True)
+        self.type_tabs.setDrawBase(False)
+        for name in ("All", "Selected", *FILE_TYPES, "Other"):
+            index = self.type_tabs.addTab(name)
+            if name == "All":
+                tooltip = "All duplicate files"
+            elif name == "Selected":
+                tooltip = "Complete duplicate groups containing at least one checked file"
+            else:
+                tooltip = f"{name} files, grouped by filename extension"
+            self.type_tabs.setTabToolTip(index, tooltip)
+        content.addWidget(self.type_tabs)
+        self.filter_panel = QWidget()
+        filter_layout = QGridLayout(self.filter_panel)
+        filter_layout.setContentsMargins(12, 8, 12, 4)
+        filter_layout.setSpacing(6)
+        self.filename_filter = QLineEdit()
+        self.file_path_filter = QLineEdit()
+        self.folder_path_filter = QLineEdit()
+        for column, (label, field) in enumerate((
+                ("Filename", self.filename_filter), ("File path", self.file_path_filter),
+                ("Folder path", self.folder_path_filter))):
+            caption = QLabel(label)
+            caption.setBuddy(field)
+            field.setAccessibleName(label + " filter")
+            field.setPlaceholderText("Contains…")
+            field.setClearButtonEnabled(True)
+            field.setToolTip("Case-insensitive text match. All filled fields must match the same file in a group.")
+            field.returnPressed.connect(self.apply_result_filters)
+            filter_layout.addWidget(caption, 0, column)
+            filter_layout.addWidget(field, 1, column)
+        size_row = QHBoxLayout()
+        self.min_size_filter = QLineEdit()
+        self.max_size_filter = QLineEdit()
+        size_label = QLabel("File size")
+        size_label.setBuddy(self.min_size_filter)
+        size_row.addWidget(size_label)
+        for label, field in (("Minimum", self.min_size_filter), ("Maximum", self.max_size_filter)):
+            field.setAccessibleName(label + " file size")
+            field.setPlaceholderText(label)
+            field.setMaxLength(32)
+            field.setMinimumWidth(60)
+            field.setToolTip(label + " size, inclusive. Leave blank for no limit; decimals are allowed.")
+            field.returnPressed.connect(self.apply_result_filters)
+            size_row.addWidget(field, 1)
+        self.size_unit = QComboBox()
+        self.size_unit.addItems(["B", "KiB", "MiB", "GiB"])
+        self.size_unit.setCurrentIndex(2)
+        self.size_unit.setAccessibleName("File size unit")
+        size_row.addWidget(self.size_unit)
+        self.apply_filter_button = QPushButton("Apply")
+        self.apply_filter_button.setToolTip("Show groups containing a file that matches all filled filters.")
+        self.apply_filter_button.clicked.connect(self.apply_result_filters)
+        self.clear_filter_button = QPushButton("Clear filters")
+        self.clear_filter_button.clicked.connect(self.clear_result_filters)
+        size_row.addWidget(self.apply_filter_button)
+        size_row.addWidget(self.clear_filter_button)
+        filter_layout.addLayout(size_row, 2, 0, 1, 3)
+        self.filter_error = QLabel()
+        self.filter_error.setObjectName("filterError")
+        self.filter_error.setWordWrap(True)
+        self.filter_error.hide()
+        filter_layout.addWidget(self.filter_error, 3, 0, 1, 3)
+        # Keep filters accessible even when the results/preview need horizontal scrolling.
+        duplicate_layout.insertWidget(0, self.filter_panel)
+        self.filter_hint = QLabel()
+        self.filter_hint.setObjectName("hint")
+        self.filter_hint.setWordWrap(True)
+        self.filter_hint.hide()
+        content.addWidget(self.filter_hint)
+        self.empty = QLabel("Click a group to preview all copies, or a file to compare two copies.\nEvery checkbox starts unchecked. You decide what to remove.")
+        self.empty.setObjectName("hint")
+        self.empty.setWordWrap(True)
+        content.addWidget(self.empty)
+        self.tree = ResultTree()
+        self.tree.setHeaderLabels(["File / duplicate group", "Full location", "Size", "Modified"])
+        self.tree.setRootIsDecorated(True)
+        self.tree.setAlternatingRowColors(True)
+        self.tree.setUniformRowHeights(True)
+        self.tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.tree.setSortingEnabled(True)
+        self.tree.sortByColumn(2, Qt.SortOrder.DescendingOrder)
+        self.tree.header().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.tree.setColumnWidth(0, 260)
+        self.tree.setColumnWidth(1, 340)
+        self.tree.setColumnWidth(2, 115)
+        self.tree.setColumnWidth(3, 150)
+        self.tree.itemChanged.connect(self.item_changed)
+        self.tree.itemSelectionChanged.connect(self.update_actions)
+        self.tree.itemSelectionChanged.connect(self.update_details)
+        self.tree.currentItemChanged.connect(self.update_details)
+        self.tree.itemDoubleClicked.connect(self.open_file)
+        self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self.show_result_menu)
+        self.thumbnails = ThumbnailController(self.tree, self)
+        self.results_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.results_splitter.setChildrenCollapsible(False)
+        self.results_splitter.setHandleWidth(8)
+        self.tree.setMinimumHeight(160)
+        self.tree.setMinimumWidth(290)
+        self.results_splitter.addWidget(self.tree)
+        self.details_panel = QWidget()
+        self.details_panel.setMinimumWidth(380)
+        details_layout = QVBoxLayout(self.details_panel)
+        details_layout.setContentsMargins(0, 0, 0, 0)
+        details_layout.setSpacing(4)
+        details_title = QLabel("Group preview")
+        details_title.setObjectName("section")
+        details_layout.addWidget(details_title)
+        self.comparison_preview = ComparisonPreview()
+        self.comparison_preview.selection_changed.connect(self.preview_selection_changed)
+        details_layout.addWidget(self.comparison_preview, 1)
+        self.details_toggle = QPushButton("File details")
+        self.details_toggle.setCheckable(True)
+        details_layout.addWidget(self.details_toggle)
+        self.details_text = QPlainTextEdit()
+        self.details_text.setReadOnly(True)
+        self.details_text.setWordWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+        self.details_text.setMinimumHeight(90)
+        self.details_text.setMaximumHeight(160)
+        self.details_text.setAccessibleName("Selected file details")
+        details_layout.addWidget(self.details_text)
+        self.details_text.hide()
+        self.details_toggle.toggled.connect(self.details_text.setVisible)
+        self.details_toggle.toggled.connect(self.update_details)
+        self.results_splitter.addWidget(self.details_panel)
+        self.results_splitter.setStretchFactor(0, 2)
+        self.results_splitter.setStretchFactor(1, 3)
+        self.details_panel.hide()
+        content.addWidget(self.results_splitter, 1)
+        foot = QHBoxLayout()
+        self.clear_button = QPushButton("Clear file selection")
+        self.clear_button.clicked.connect(self.clear_selection)
+        foot.addWidget(self.clear_button)
+        self.select_folder_button = QPushButton("Select this folder's duplicates")
+        self.select_folder_button.setToolTip(
+            "Check every verified duplicate in the highlighted file's exact folder, including files in other tabs.")
+        self.select_folder_button.clicked.connect(lambda: self.select_folder_duplicates())
+        foot.addWidget(self.select_folder_button)
+        self.issue_button = QPushButton("Skipped files / errors (0)")
+        self.issue_button.clicked.connect(self.show_issues)
+        foot.addWidget(self.issue_button)
+        foot.addStretch()
+        content.addLayout(foot)
+
+        self.selection_label = QLabel("0 files selected for recycling")
+        self.selection_label.setObjectName("section")
+        self.selection_label.setWordWrap(True)
+        content.addWidget(self.selection_label)
+        action_row = QHBoxLayout()
+        recycle_hint = QLabel("You may select every copy in a group.\nDisk space is freed when you empty the Recycle Bin yourself.")
+        recycle_hint.setObjectName("hint")
+        recycle_hint.setWordWrap(True)
+        action_row.addWidget(recycle_hint, 1)
+        self.recycle_button = QPushButton("Recycle selected files")
+        self.recycle_button.setObjectName("primary")
+        self.recycle_button.clicked.connect(self.confirm_recycle)
+        action_row.addWidget(self.recycle_button)
+        content.addLayout(action_row)
+
+        empty_page = QWidget()
+        empty_content = QVBoxLayout(empty_page)
+        empty_content.setContentsMargins(12, 12, 12, 12)
+        empty_content.setSpacing(12)
+        self.empty_folder_summary = QLabel("Ready to check for empty folders")
+        self.empty_folder_summary.setObjectName("summary")
+        self.empty_folder_summary.setWordWrap(True)
+        empty_content.addWidget(self.empty_folder_summary)
+        empty_heading = QHBoxLayout()
+        empty_section = QLabel("Review empty folders")
+        empty_section.setObjectName("section")
+        empty_heading.addWidget(empty_section)
+        empty_heading.addStretch()
+        self.empty_scan_button = QPushButton("Scan empty folders")
+        self.empty_scan_button.setObjectName("primary")
+        self.empty_scan_button.setToolTip(
+            "Use the chosen folders and Include subfolders setting. Duplicate results are not changed.")
+        self.empty_scan_button.clicked.connect(self.start_empty_folder_scan)
+        empty_heading.addWidget(self.empty_scan_button)
+        empty_content.addLayout(empty_heading)
+        self.empty_folder_hint = QLabel(
+            "Only truly empty folders are listed. Selected scan roots, links, and junctions are excluded.\n"
+            "Every checkbox starts unchecked. Double-click a row to open the folder.")
+        self.empty_folder_hint.setObjectName("hint")
+        self.empty_folder_hint.setWordWrap(True)
+        empty_content.addWidget(self.empty_folder_hint)
+        self.empty_folder_tree = ResultTree()
+        self.empty_folder_tree.setHeaderLabels(["Folder", "Full path", "Modified"])
+        self.empty_folder_tree.setRootIsDecorated(False)
+        self.empty_folder_tree.setAlternatingRowColors(True)
+        self.empty_folder_tree.setUniformRowHeights(True)
+        self.empty_folder_tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.empty_folder_tree.setSortingEnabled(True)
+        self.empty_folder_tree.sortByColumn(1, Qt.SortOrder.AscendingOrder)
+        self.empty_folder_tree.header().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.empty_folder_tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.empty_folder_tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.empty_folder_tree.setColumnWidth(0, 170)
+        self.empty_folder_tree.itemChanged.connect(self.empty_folder_item_changed)
+        self.empty_folder_tree.itemDoubleClicked.connect(self.open_empty_folder)
+        empty_content.addWidget(self.empty_folder_tree, 1)
+        empty_foot = QHBoxLayout()
+        self.clear_empty_folders_button = QPushButton("Clear folder selection")
+        self.clear_empty_folders_button.clicked.connect(self.clear_empty_folder_selection)
+        empty_foot.addWidget(self.clear_empty_folders_button)
+        self.empty_folder_issue_button = QPushButton("Skipped folders / errors (0)")
+        self.empty_folder_issue_button.clicked.connect(self.show_empty_folder_issues)
+        empty_foot.addWidget(self.empty_folder_issue_button)
+        empty_foot.addStretch()
+        empty_content.addLayout(empty_foot)
+        self.empty_folder_selection_label = QLabel("0 folders selected for recycling")
+        self.empty_folder_selection_label.setObjectName("section")
+        self.empty_folder_selection_label.setWordWrap(True)
+        empty_content.addWidget(self.empty_folder_selection_label)
+        empty_action = QHBoxLayout()
+        empty_recycle_hint = QLabel(
+            "Folders are checked again before being sent to the Recycle Bin.\n"
+            "Nothing is permanently deleted.")
+        empty_recycle_hint.setObjectName("hint")
+        empty_recycle_hint.setWordWrap(True)
+        empty_action.addWidget(empty_recycle_hint, 1)
+        self.recycle_empty_folders_button = QPushButton("Recycle selected folders")
+        self.recycle_empty_folders_button.setObjectName("primary")
+        self.recycle_empty_folders_button.clicked.connect(self.confirm_empty_folder_recycle)
+        empty_action.addWidget(self.recycle_empty_folders_button)
+        empty_content.addLayout(empty_action)
+        self.workflow_tabs.addTab(empty_page, "Empty folders")
+        splitter.addWidget(main)
+        splitter.setSizes([265, 900])
+        splitter.setStretchFactor(1, 1)
+
+        status_row = QHBoxLayout()
+        self.status = QLabel("Add folders to begin.")
+        self.status.setWordWrap(True)
+        status_row.addWidget(self.status, 1)
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.clicked.connect(self.cancel_work)
+        status_row.addWidget(self.cancel_button)
+        layout.addLayout(status_row)
+        self.current_path = QLabel("")
+        self.current_path.setObjectName("hint")
+        self.current_path.setMinimumWidth(0)
+        layout.addWidget(self.current_path)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        layout.addWidget(self.progress_bar)
+        self.type_tabs.currentChanged.connect(self.filter_results)
+        self.workflow_tabs.currentChanged.connect(self.update_details)
+        self.update_actions()
+
+    def toggle_sidebar(self, visible):
+        if not visible:
+            self._sidebar_sizes = self.main_splitter.sizes()
+        self.sidebar.setVisible(visible)
+        self.sidebar_container.setMaximumWidth(16777215 if visible else self.sidebar_toggle.width())
+        label = "Hide sidebar" if visible else "Show sidebar"
+        self.sidebar_toggle.setToolTip(label)
+        self.sidebar_toggle.setAccessibleName(label)
+        if visible:
+            self.main_splitter.setSizes(self._sidebar_sizes)
+        else:
+            width = self.sidebar_toggle.width()
+            self.main_splitter.setSizes([width, sum(self._sidebar_sizes) - width])
+
+    def change_theme(self, dark):
+        apply_theme(dark)
+        self.update_control_icons()
+        self.settings.setValue("appearance/dark_mode", dark)
+
+    def update_control_icons(self):
+        dark = self.dark_mode.isChecked()
+        self.dark_mode.setIcon(control_icon("sun" if dark else "moon", dark))
+        label = "Switch to light mode" if dark else "Switch to dark mode"
+        self.dark_mode.setToolTip(label)
+        self.dark_mode.setAccessibleName(label)
+        self.sidebar_toggle.setIcon(control_icon("sidebar", dark))
+
+    def add_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Choose a folder to scan")
+        if folder:
+            self.add_folder_path(folder)
+
+    def add_folder_path(self, folder):
+        folder = os.path.abspath(folder)
+        existing = {os.path.normcase(self.folders.item(i).text()) for i in range(self.folders.count())}
+        if os.path.normcase(folder) not in existing:
+            self.folders.addItem(folder)
+            self.folders.item(self.folders.count() - 1).setToolTip(folder)
+        self.update_actions()
+
+    def remove_folders(self):
+        for item in self.folders.selectedItems():
+            self.folders.takeItem(self.folders.row(item))
+        for index in reversed(range(self.excluded_folders.count())):
+            if not self.is_scan_subfolder(self.excluded_folders.item(index).text()):
+                self.excluded_folders.takeItem(index)
+        self.update_actions()
+
+    def is_scan_subfolder(self, folder):
+        parents = Path(os.path.abspath(folder)).parents
+        return any(Path(self.folders.item(index).text()) in parents
+                   for index in range(self.folders.count()))
+
+    def choose_excluded_folder(self):
+        if self.worker is not None or not self.folders.count():
+            return
+        root = self.folders.currentItem() or self.folders.item(0)
+        folder = QFileDialog.getExistingDirectory(self, "Choose a subfolder to exclude", root.text())
+        if folder:
+            self.add_excluded_folder_path(folder)
+
+    def add_excluded_folder_path(self, folder):
+        folder = os.path.abspath(folder)
+        if not self.is_scan_subfolder(folder):
+            QMessageBox.warning(self, "Choose a subfolder",
+                                "Choose a subfolder inside one of the added scan folders.")
+            return
+        if Path(folder) not in {Path(path) for path in self.excluded_folder_paths()}:
+            self.excluded_folders.addItem(folder)
+            self.excluded_folders.item(self.excluded_folders.count() - 1).setToolTip(folder)
+        self.update_actions()
+
+    def excluded_folder_paths(self):
+        return tuple(self.excluded_folders.item(index).text()
+                     for index in range(self.excluded_folders.count()))
+
+    def remove_exclusions(self):
+        for item in self.excluded_folders.selectedItems():
+            self.excluded_folders.takeItem(self.excluded_folders.row(item))
+        self.update_actions()
+
+    def update_actions(self):
+        busy = self.worker is not None
+        for widget in (self.add_button, self.remove_button, self.recursive, self.folders,
+                       self.excluded_folders, self.tree, self.type_tabs, self.filter_panel,
+                       self.comparison_preview, self.empty_folder_tree):
+            widget.setEnabled(not busy)
+        self.exclude_button.setEnabled(not busy and self.folders.count() > 0)
+        self.remove_exclusion_button.setEnabled(not busy and bool(self.excluded_folders.selectedItems()))
+        self.scan_button.setEnabled(not busy and self.folders.count() > 0)
+        self.empty_scan_button.setEnabled(not busy and self.folders.count() > 0)
+        self.save_session_button.setEnabled(not busy and self.session_available)
+        self.load_session_button.setEnabled(not busy)
+        self.cancel_button.setEnabled(busy and not self.worker.cancel_event.is_set())
+        self.recycle_button.setEnabled(not busy and bool(self.selected))
+        self.clear_button.setEnabled(not busy and bool(self.selected))
+        self.issue_button.setEnabled(bool(self.issues))
+        self.issue_button.setText(f"Skipped files / errors ({len(self.issues):,})")
+        current = self.tree.currentItem()
+        current_is_file = current is not None and current.parent() is not None
+        self.open_button.setEnabled(not busy and current_is_file)
+        self.select_folder_button.setEnabled(not busy and current_is_file)
+        self.recycle_empty_folders_button.setEnabled(
+            not busy and bool(self.selected_empty_folders))
+        self.clear_empty_folders_button.setEnabled(
+            not busy and bool(self.selected_empty_folders))
+        self.empty_folder_issue_button.setEnabled(bool(self.empty_folder_issues))
+        self.empty_folder_issue_button.setText(
+            f"Skipped folders / errors ({len(self.empty_folder_issues):,})")
+        amount = sum(self.records[path].size for path in self.selected)
+        noun = "file" if len(self.selected) == 1 else "files"
+        hidden = len(self.selected - self.visible_paths)
+        suffix = f"  ·  {hidden:,} hidden by this tab or filters" if hidden else ""
+        self.selection_label.setText(f"{len(self.selected):,} {noun} selected  ·  {format_bytes(amount)}{suffix}")
+        folder_noun = "folder" if len(self.selected_empty_folders) == 1 else "folders"
+        self.empty_folder_selection_label.setText(
+            f"{len(self.selected_empty_folders):,} {folder_noun} selected for recycling")
+
+    def apply_result_filters(self):
+        sizes = []
+        for field in (self.min_size_filter, self.max_size_filter):
+            value = field.text().strip()
+            if not value:
+                sizes.append(None)
+            elif re.fullmatch(r"(?:\d+(?:\.\d*)?|\.\d+)", value, flags=re.ASCII):
+                sizes.append(Decimal(value) * (1024 ** self.size_unit.currentIndex()))
+            else:
+                self.filter_error.setText("Enter a nonnegative size, such as 0, 1.5, or 250. Filters were not changed.")
+                self.filter_error.show()
+                return
+        minimum, maximum = sizes
+        if minimum is not None and maximum is not None and minimum > maximum:
+            self.filter_error.setText("Minimum size must not exceed maximum size. Filters were not changed.")
+            self.filter_error.show()
+            return
+        self.result_filters = {
+            "filename": self.filename_filter.text().strip().casefold(),
+            "file_path": self.file_path_filter.text().strip().replace("\\", "/").casefold(),
+            "folder_path": self.folder_path_filter.text().strip().replace("\\", "/").casefold(),
+            "min_size": minimum, "max_size": maximum,
+        }
+        self.result_filters = {key: value for key, value in self.result_filters.items()
+                               if value is not None and value != ""}
+        self.filter_error.hide()
+        self.filter_results()
+
+    def clear_result_filters(self):
+        for field in (self.filename_filter, self.file_path_filter, self.folder_path_filter,
+                      self.min_size_filter, self.max_size_filter):
+            field.clear()
+        self.result_filters = {}
+        self.filter_error.hide()
+        self.filter_results()
+
+    def group_matches_filters(self, group):
+        filters = self.result_filters
+        if not filters:
+            return True
+        return any(
+            filters.get("filename", "") in record.path.name.casefold()
+            and filters.get("file_path", "") in record.path.as_posix().casefold()
+            and filters.get("folder_path", "") in record.path.parent.as_posix().casefold()
+            and (filters.get("min_size") is None or record.size >= filters["min_size"])
+            and (filters.get("max_size") is None or record.size <= filters["max_size"])
+            for record in group.files)
+
+    def filter_results(self):
+        self.thumbnails.dismiss()
+        category = self.type_tabs.tabText(self.type_tabs.currentIndex())
+        selected_view = category == "Selected"
+        self.visible_paths.clear()
+        visible_groups = 0
+        self.tree.setUpdatesEnabled(False)
+        sorting = self.tree.isSortingEnabled()
+        labels = []
+        try:
+            for index in range(self.tree.topLevelItemCount()):
+                parent = self.tree.topLevelItem(index)
+                group_matches = self.group_matches_filters(parent.data(0, Qt.ItemDataRole.UserRole))
+                group_selected = selected_view and any(
+                    parent.child(child_index).data(0, Qt.ItemDataRole.UserRole).path in self.selected
+                    for child_index in range(parent.childCount())
+                )
+                visible = 0
+                for child_index in range(parent.childCount()):
+                    child = parent.child(child_index)
+                    record = child.data(0, Qt.ItemDataRole.UserRole)
+                    matches = group_matches and (category == "All" or group_selected or file_type(record.path) == category)
+                    child.setHidden(not matches)
+                    if matches:
+                        self.visible_paths.add(record.path)
+                        visible += 1
+                parent.setHidden(visible == 0)
+                if visible:
+                    visible_groups += 1
+                label = ("" if visible == parent.childCount() else
+                         f"{visible} of {parent.childCount()} files shown")
+                if parent.text(1) != label:
+                    labels.append((parent, label))
+            # Defer sort-key changes until traversal ends; unchanged labels need no resort.
+            if labels:
+                self.tree.setSortingEnabled(False)
+                for parent, label in labels:
+                    parent.setText(1, label)
+            current = self.tree.currentItem()
+            if current is not None and (current.isHidden() or
+                                       (current.parent() is not None and current.parent().isHidden())):
+                self.tree.setCurrentItem(None)
+                self.tree.clearSelection()
+        finally:
+            if labels:
+                self.tree.setSortingEnabled(sorting)
+            self.tree.setUpdatesEnabled(True)
+        if self.result_filters:
+            self.filter_hint.setText(
+                f"{visible_groups:,} of {len(self.groups):,} duplicate groups shown · filters applied. "
+                "Each matching group contains a file meeting all criteria. "
+                "Other copies remain available; file-type tabs still apply.")
+        elif selected_view and self.selected:
+            noun = "group" if visible_groups == 1 else "groups"
+            checked = "file" if len(self.selected) == 1 else "files"
+            self.filter_hint.setText(
+                f"{visible_groups:,} duplicate {noun} containing {len(self.selected):,} checked {checked}. "
+                "Unchecked copies are shown so you can see what will remain.")
+        elif selected_view:
+            self.filter_hint.setText("No files are checked. Choose files in any tab to show their complete duplicate groups here.")
+        elif self.visible_paths:
+            self.filter_hint.setText(f"{len(self.visible_paths):,} of {len(self.records):,} duplicate files shown by extension. "
+                                     "Group totals and savings include copies in other tabs.")
+        else:
+            self.filter_hint.setText(f"No duplicate files in {category}. Choose All to see other file types.")
+        self.filter_hint.setVisible(bool(self.result_filters) or (category != "All" and bool(self.groups)))
+        self.update_actions()
+        self.update_details()
+
+    def refresh_selection_view(self):
+        if self.type_tabs.tabText(self.type_tabs.currentIndex()) == "Selected":
+            self.filter_results()
+        else:
+            self.update_actions()
+            self.update_details()
+
+    def start_job(self, job, handler, error_handler=None):
+        self.thumbnails.clear()
+        self.comparison_preview.clear()
+        self.worker = Worker(job, self)
+        self.worker.progress.connect(self.on_progress)
+        self.worker.outcome.connect(handler)
+        self.worker.failed.connect(error_handler or self.on_failure)
+        self.worker.finished.connect(self.job_finished)
+        self.update_actions()
+        self.worker.start()
+
+    def start_scan(self):
+        if self.worker is not None or not self.folders.count():
+            return
+        self.workflow_tabs.setCurrentIndex(0)
+        roots = [self.folders.item(i).text() for i in range(self.folders.count())]
+        recursive = self.recursive.isChecked()
+        exclusions = self.excluded_folder_paths()
+        self.session_available = False
+        self.session_path = None
+        self.scan_file_count = 0
+        self.scan_total_bytes = 0
+        self.set_groups([])
+        self.issues = []
+        self.summary.setText("Scanning your folders…")
+        self.empty.setText("Checking size → samples → SHA-256 → every byte. No files will be changed.")
+        self.start_job(lambda **kwargs: scan(roots, recursive, excluded_folders=exclusions, **kwargs),
+                       self.on_scan)
+
+    def start_empty_folder_scan(self):
+        if self.worker is not None or not self.folders.count():
+            return
+        self.workflow_tabs.setCurrentIndex(1)
+        roots = [self.folders.item(index).text() for index in range(self.folders.count())]
+        recursive = self.recursive.isChecked()
+        exclusions = self.excluded_folder_paths()
+        self.set_empty_folders([])
+        self.empty_folder_issues = []
+        self.empty_folder_summary.setText("Checking for empty folders…")
+        self.empty_folder_hint.setText(
+            "Scanning folder entries only. Duplicate files and duplicate results are not inspected or changed.")
+        self.start_job(
+            lambda **kwargs: scan_empty_folders(roots, recursive, excluded_folders=exclusions, **kwargs),
+            self.on_empty_folder_scan, self.on_empty_folder_failure,
+        )
+
+    def save_session(self):
+        if self.worker is not None or not self.session_available:
+            return
+        if self.session_path is None:
+            default = Path.home() / f"Duplicate Cleaner {datetime.now():%Y-%m-%d %H%M}.dupsession"
+        else:
+            default = self.session_path
+        filename, _ = QFileDialog.getSaveFileName(
+            self, "Save Duplicate Cleaner session", str(default),
+            "Duplicate Cleaner sessions (*.dupsession)")
+        if not filename:
+            return
+        path = Path(filename)
+        if not path.suffix:
+            path = path.with_suffix(".dupsession")
+        data = SessionData(
+            tuple(self.groups), frozenset(self.selected),
+            tuple(self.folders.item(index).text() for index in range(self.folders.count())),
+            self.recursive.isChecked(), tuple(self.issues), self.scan_file_count,
+            self.scan_total_bytes, self.type_tabs.tabText(self.type_tabs.currentIndex()),
+            excluded_folders=self.excluded_folder_paths(),
+        )
+        self.status.setText("Preparing session file…")
+        self.start_job(
+            lambda **kwargs: save_session_file(path, data, **kwargs), self.on_session_saved,
+            lambda message: self.on_session_failure("Could not save session", message),
+        )
+
+    def on_session_saved(self, result: SaveResult):
+        if result.cancelled:
+            self.status.setText("Session save cancelled. Existing session files were not changed.")
+            return
+        self.session_path = result.path
+        self.status.setText(f"Session saved · {result.path}")
+
+    def load_session(self):
+        if self.worker is not None:
+            return
+        filename, _ = QFileDialog.getOpenFileName(
+            self, "Load Duplicate Cleaner session", str(Path.home()),
+            "Duplicate Cleaner sessions (*.dupsession);;All files (*.*)")
+        if not filename:
+            return
+        path = Path(filename)
+        self.status.setText("Reading and validating saved session…")
+        self.start_job(
+            lambda **kwargs: load_session_file(path, **kwargs), self.on_session_loaded,
+            lambda message: self.on_session_failure("Could not load session", message),
+        )
+
+    def on_session_loaded(self, result: LoadResult):
+        if result.cancelled:
+            self.status.setText("Session load cancelled. Current results were not changed.")
+            return
+        data = result.data
+        if data is None:
+            self.on_session_failure("Could not load session", "The session did not contain usable data.")
+            return
+        restorable = len(data.selected)
+        saved_when = datetime.fromisoformat(data.saved_at).strftime("%Y-%m-%d %H:%M:%S")
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Load saved session")
+        dialog.setIcon(QMessageBox.Icon.Question)
+        dialog.setText(f"Load the duplicate results saved on {saved_when}?")
+        information = (
+            "Loading replaces the results and selections currently shown. Files were checked for "
+            "identity and timestamps; contents will still be verified again before recycling."
+        )
+        if result.saved_selection_count:
+            information = (
+                f"This session saved {result.saved_selection_count:,} checked file(s). "
+                f"{restorable:,} can be restored and {result.dropped_selected:,} cannot be restored.\n\n"
+                + information
+            )
+        dialog.setInformativeText(information)
+        without = dialog.addButton("Load with nothing checked", QMessageBox.ButtonRole.AcceptRole)
+        restore = None
+        if restorable:
+            restore_noun = "file" if restorable == 1 else "files"
+            restore = dialog.addButton(f"Restore {restorable:,} checked {restore_noun}",
+                                       QMessageBox.ButtonRole.ActionRole)
+        cancel = dialog.addButton(QMessageBox.StandardButton.Cancel)
+        dialog.setDefaultButton(without)
+        dialog.exec()
+        clicked = dialog.clickedButton()
+        choices = tuple(button for button in (without, restore) if button is not None)
+        if clicked == cancel or clicked not in choices:
+            self.status.setText("Session load cancelled. Current results were not changed.")
+            return
+        restore_checks = restore is not None and clicked == restore
+
+        self.workflow_tabs.setCurrentIndex(0)
+        self.issues = list(data.issues) + list(result.validation_issues)
+        self.scan_file_count = data.file_count
+        self.scan_total_bytes = data.total_bytes
+        self.session_available = True
+        self.session_path = result.path
+        self.folders.clear()
+        self.excluded_folders.clear()
+        for root in data.roots:
+            self.add_folder_path(root)
+        for folder in data.excluded_folders:
+            self.add_excluded_folder_path(folder)
+        self.recursive.setChecked(data.recursive)
+        self.set_groups(data.groups)
+        if restore_checks:
+            self._changing_checks = True
+            try:
+                for item in self.file_items():
+                    record = item.data(0, Qt.ItemDataRole.UserRole)
+                    if record.path in data.selected:
+                        item.setCheckState(0, Qt.CheckState.Checked)
+                self.selected.update(data.selected)
+            finally:
+                self._changing_checks = False
+        tab_name = data.active_tab
+        if tab_name == "Selected" and not restore_checks:
+            tab_name = "All"
+        tab_index = next((index for index in range(self.type_tabs.count())
+                          if self.type_tabs.tabText(index) == tab_name), 0)
+        self.type_tabs.setCurrentIndex(tab_index)
+        self.filter_results()
+        savings = sum(group.extra_bytes for group in self.groups)
+        noun = "group" if len(self.groups) == 1 else "groups"
+        self.summary.setText(
+            f"Loaded {len(self.groups):,} duplicate {noun} · {format_bytes(savings)} potentially recoverable")
+        self.empty.setText(
+            "No usable duplicate groups remain in this session. Changed or missing files are listed under errors.")
+        action = f"{len(data.selected):,} saved checks restored" if restore_checks else "all files left unchecked"
+        self.status.setText(
+            f"Session loaded · {action} · {result.dropped_files:,} changed or missing files · "
+            f"{result.dropped_groups:,} incomplete groups removed")
+
+    def on_session_failure(self, title, message):
+        self.status.setText(message)
+        QMessageBox.critical(self, title, message + "\n\nCurrent results were not changed.")
+
+    def set_groups(self, groups):
+        self.thumbnails.clear()
+        self.comparison_preview.clear()
+        self.details_text.clear()
+        self.details_panel.hide()
+        self.groups = list(groups)
+        groups = self.groups
+        self.selected.clear()
+        self.records = {record.path: record for group in groups for record in group.files}
+        self._changing_checks = True
+        self.tree.setSortingEnabled(False)
+        self.tree.setUpdatesEnabled(False)
+        try:
+            self.tree.clear()
+            for number, group in enumerate(groups, 1):
+                parent = ResultItem(self.tree, [
+                    f"Group {number} · {len(group.files)} identical files", "", "", "",
+                ])
+                parent.setData(2, Qt.ItemDataRole.UserRole, group.extra_bytes)
+                parent.setData(0, Qt.ItemDataRole.UserRole, group)
+                parent.setToolTip(0, f"Full SHA-256: {group.digest}")
+                font = QFont()
+                font.setBold(True)
+                parent.setFont(0, font)
+                for record in group.files:
+                    modified = datetime.fromtimestamp(record.modified_ns / 1_000_000_000)
+                    child = ResultItem(parent, [record.path.name, str(record.path),
+                                               format_bytes(record.size), modified.strftime("%Y-%m-%d %H:%M:%S")])
+                    child.setData(0, Qt.ItemDataRole.UserRole, record)
+                    child.setData(2, Qt.ItemDataRole.UserRole, record.size)
+                    child.setFlags(child.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                    child.setCheckState(0, Qt.CheckState.Unchecked)
+                    child.setToolTip(0, str(record.path))
+                    child.setToolTip(1, str(record.path))
+                parent.setExpanded(len(groups) <= 100)
+        finally:
+            self.tree.setSortingEnabled(True)
+            self.tree.setUpdatesEnabled(True)
+            self._changing_checks = False
+        self.empty.setVisible(not groups)
+        self.filter_results()
+
+    def item_changed(self, item, column):
+        if self._changing_checks or column != 0 or item.parent() is None:
+            return
+        record = item.data(0, Qt.ItemDataRole.UserRole)
+        checked = item.checkState(0) == Qt.CheckState.Checked
+        if checked:
+            self.selected.add(record.path)
+        else:
+            self.selected.discard(record.path)
+        self.refresh_selection_view()
+
+    def preview_selection_changed(self, path, checked):
+        if self.worker is not None:
+            return
+        for item in self.file_items():
+            if item.data(0, Qt.ItemDataRole.UserRole).path == path:
+                item.setCheckState(0, Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+                break
+
+    def file_items(self):
+        for index in range(self.tree.topLevelItemCount()):
+            parent = self.tree.topLevelItem(index)
+            for child_index in range(parent.childCount()):
+                yield parent.child(child_index)
+
+    def select_folder_duplicates(self, item=None):
+        if self.worker is not None:
+            return
+        if item is None:
+            item = self.tree.currentItem()
+        if item is None or item.parent() is None:
+            return
+        record = item.data(0, Qt.ItemDataRole.UserRole)
+        folder = record.path.parent
+        folder_key = os.path.normcase(os.path.abspath(str(folder)))
+        matches = []
+        for child in self.file_items():
+            child_record = child.data(0, Qt.ItemDataRole.UserRole)
+            child_folder = os.path.normcase(os.path.abspath(str(child_record.path.parent)))
+            if child_folder == folder_key:
+                matches.append(child)
+        paths = {child.data(0, Qt.ItemDataRole.UserRole).path for child in matches}
+        newly_selected = len(paths - self.selected)
+        self._changing_checks = True
+        try:
+            for child in matches:
+                child.setCheckState(0, Qt.CheckState.Checked)
+            self.selected.update(paths)
+        finally:
+            self._changing_checks = False
+        self.refresh_selection_view()
+        hidden = len(paths - self.visible_paths)
+        noun = "file" if len(paths) == 1 else "files"
+        message = (f"Selected {newly_selected:,} new · {len(paths):,} duplicate {noun} selected in {folder}")
+        if hidden:
+            message += f" · {hidden:,} hidden by this tab"
+        self.status.setText(message)
+
+    def show_result_menu(self, position):
+        item = self.tree.itemAt(position)
+        if item is None or item.parent() is None:
+            return
+        self.tree.setCurrentItem(item)
+        menu = QMenu(self)
+        open_location = menu.addAction("Open file location")
+        open_location.triggered.connect(self.open_folder)
+        menu.addSeparator()
+        select_folder = menu.addAction("Select all duplicates in this folder")
+        select_folder.setEnabled(self.worker is None)
+        select_folder.triggered.connect(lambda: self.select_folder_duplicates(item))
+        menu.exec(self.tree.viewport().mapToGlobal(position))
+
+    def clear_selection(self):
+        self._changing_checks = True
+        for item in self.file_items():
+            item.setCheckState(0, Qt.CheckState.Unchecked)
+        self._changing_checks = False
+        self.selected.clear()
+        self.refresh_selection_view()
+
+    def update_details(self):
+        self.preview_toggle.setText("Hide preview" if self.preview_toggle.isChecked() else "Show preview")
+        item = self.tree.currentItem()
+        if (self._changing_checks or item is None or not item.isSelected()
+                or self.workflow_tabs.currentIndex() != 0):
+            self.details_text.clear()
+            self.comparison_preview.clear()
+            self.details_panel.hide()
+            self.results_splitter.setMinimumHeight(160)
+            return
+        is_file = item.parent() is not None
+        group = (item.parent() if is_file else item).data(0, Qt.ItemDataRole.UserRole)
+        record = item.data(0, Qt.ItemDataRole.UserRole) if is_file else group.files[0]
+        if self.preview_toggle.isChecked() and self.worker is None:
+            self.comparison_preview.set_group(group, record if is_file else None, self.selected)
+        else:
+            self.comparison_preview.clear()
+        modified = datetime.fromtimestamp(record.modified_ns / 1_000_000_000)
+        info = QFileInfo(str(record.path))
+        created = info.birthTime()
+        selection = "Selected for recycling" if record.path in self.selected else "Unchecked — will remain"
+        try:
+            ensure_current(record)
+            state = "Matches the scanned file identity and timestamps"
+        except OSError as exc:
+            state = f"Changed or unavailable — scan again. {exc}"
+        lines = [
+            f"Name: {record.path.name}",
+            f"Type: {record.path.suffix.upper()[1:] + ' file' if record.path.suffix else 'No extension'}",
+            f"Full path: {record.path}",
+            f"Size at scan: {format_bytes(record.size)} ({record.size:,} bytes)",
+            f"Modified at scan: {modified:%Y-%m-%d %H:%M:%S}",
+            f"Created: {created.toString('yyyy-MM-dd HH:mm:ss') if created.isValid() else 'Unavailable'}",
+            f"Duplicate group: {len(group.files)} copies verified byte for byte at scan time",
+            f"SHA-256 at scan: {group.digest}",
+            f"Selection: {selection}",
+            f"Current status: {state}",
+        ]
+        self.details_text.setPlainText("\n".join(lines))
+        was_hidden = self.details_panel.isHidden()
+        self.details_panel.setVisible(self.preview_toggle.isChecked())
+        self.results_splitter.setMinimumHeight(
+            self.details_panel.minimumSizeHint().height() if self.preview_toggle.isChecked() else 160)
+        if was_hidden and self.preview_toggle.isChecked():
+            width = self.results_splitter.width()
+            self.results_splitter.setSizes([max(290, width * 2 // 5), max(380, width * 3 // 5)])
+
+    def open_file(self, item, column=0):
+        if self.worker is not None or item is None or item.parent() is None:
+            return
+        self.thumbnails.dismiss()
+        record = item.data(0, Qt.ItemDataRole.UserRole)
+        try:
+            ensure_current(record)
+        except OSError as exc:
+            QMessageBox.warning(self, "Cannot open this file", f"The file changed or is unavailable. Scan again.\n\n{exc}")
+            self.update_details()
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(record.path))):
+            QMessageBox.warning(self, "Could not open file",
+                                f"Windows could not open this file. Check its default app association.\n\n{record.path}")
+
+    def on_progress(self, progress: Progress):
+        unit = "folders" if "folder" in progress.stage.casefold() else "files"
+        self.status.setText(f"{progress.stage}  ·  {progress.completed:,}"
+                            + (f" / {progress.total:,} {unit}" if progress.total else f" {unit}")
+                            + (f"  ·  {format_bytes(progress.bytes_read)} read"
+                               if progress.bytes_read or unit == "files" else ""))
+        self.status.setToolTip(progress.path)
+        self.current_path.setText(self.current_path.fontMetrics().elidedText(
+            progress.path, Qt.TextElideMode.ElideMiddle, max(200, self.width() - 70)
+        ))
+        self.current_path.setToolTip(progress.path)
+        if progress.total:
+            self.progress_bar.setRange(0, 1000)
+            self.progress_bar.setValue(min(1000, int(progress.completed / progress.total * 1000)))
+        else:
+            self.progress_bar.setRange(0, 0)
+
+    def on_scan(self, result: ScanResult):
+        self.issues = result.issues
+        self.scan_file_count = result.file_count
+        self.scan_total_bytes = result.total_bytes
+        self.session_available = not result.cancelled
+        self.set_groups(result.groups)
+        savings = sum(group.extra_bytes for group in result.groups)
+        if result.cancelled:
+            self.summary.setText("Scan cancelled — no files changed")
+            self.empty.setText("Start another scan when you are ready. Partial results are not used for cleanup.")
+        else:
+            noun = "group" if len(result.groups) == 1 else "groups"
+            self.summary.setText(f"{len(result.groups):,} duplicate {noun}  ·  {format_bytes(savings)} potentially recoverable")
+            self.empty.setText("No verified duplicates found. Check skipped files / errors for anything we could not inspect.")
+        self.status.setText(f"{'Cancelled' if result.cancelled else 'Scan complete'}  ·  "
+                            f"{result.file_count:,} files discovered  ·  {format_bytes(result.total_bytes)}  ·  "
+                            f"{len(result.issues):,} skipped / errors")
+
+    def set_empty_folders(self, folders):
+        self.empty_folders = list(folders)
+        self.selected_empty_folders.clear()
+        self._changing_empty_checks = True
+        self.empty_folder_tree.setSortingEnabled(False)
+        self.empty_folder_tree.setUpdatesEnabled(False)
+        try:
+            self.empty_folder_tree.clear()
+            for record in self.empty_folders:
+                modified = datetime.fromtimestamp(record.modified_ns / 1_000_000_000)
+                item = ResultItem(self.empty_folder_tree, [
+                    record.path.name, str(record.path), modified.strftime("%Y-%m-%d %H:%M:%S")])
+                item.setData(0, Qt.ItemDataRole.UserRole, record)
+                item.setData(2, Qt.ItemDataRole.UserRole, record.modified_ns)
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(0, Qt.CheckState.Unchecked)
+                item.setToolTip(0, str(record.path))
+                item.setToolTip(1, str(record.path))
+        finally:
+            self.empty_folder_tree.setSortingEnabled(True)
+            self.empty_folder_tree.setUpdatesEnabled(True)
+            self._changing_empty_checks = False
+        self.update_actions()
+
+    def empty_folder_items(self):
+        for index in range(self.empty_folder_tree.topLevelItemCount()):
+            yield self.empty_folder_tree.topLevelItem(index)
+
+    def empty_folder_item_changed(self, item, column):
+        if self._changing_empty_checks or column != 0:
+            return
+        record = item.data(0, Qt.ItemDataRole.UserRole)
+        if item.checkState(0) == Qt.CheckState.Checked:
+            self.selected_empty_folders.add(record.path)
+        else:
+            self.selected_empty_folders.discard(record.path)
+        self.update_actions()
+
+    def clear_empty_folder_selection(self):
+        self._changing_empty_checks = True
+        try:
+            for item in self.empty_folder_items():
+                item.setCheckState(0, Qt.CheckState.Unchecked)
+        finally:
+            self._changing_empty_checks = False
+        self.selected_empty_folders.clear()
+        self.update_actions()
+
+    def on_empty_folder_scan(self, result: EmptyFolderScanResult):
+        self.empty_folder_issues = result.issues
+        self.set_empty_folders(result.folders)
+        if result.cancelled:
+            self.empty_folder_summary.setText("Empty-folder scan cancelled — no folders changed")
+            self.empty_folder_hint.setText(
+                "Start another empty-folder scan when ready. Partial results are not used for cleanup.")
+        else:
+            noun = "folder" if len(result.folders) == 1 else "folders"
+            self.empty_folder_summary.setText(
+                f"{len(result.folders):,} empty {noun} found · nothing selected automatically")
+            self.empty_folder_hint.setText(
+                "No empty folders found." if not result.folders else
+                "Review full paths and check only the folders you want to recycle. "
+                "Rescan after cleanup to discover parent folders that have become empty.")
+        self.status.setText(
+            f"{'Cancelled' if result.cancelled else 'Empty-folder scan complete'}  ·  "
+            f"{result.folder_count:,} folders inspected  ·  {len(result.issues):,} skipped / errors")
+
+    def confirm_empty_folder_recycle(self):
+        if self.worker is not None or not self.selected_empty_folders:
+            return
+        selected = frozenset(self.selected_empty_folders)
+        folders = tuple(self.empty_folders)
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Confirm empty-folder recycling")
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        noun = "folder" if len(selected) == 1 else "folders"
+        dialog.setText(f"Send {len(selected):,} selected empty {noun} to the Recycle Bin?")
+        dialog.setInformativeText(
+            "Only checked folders will be recycled. Each folder must still be empty, unchanged, and safe. "
+            "Anything that fails these checks will be skipped. Nothing is permanently deleted.")
+        dialog.setDetailedText("SELECTED EMPTY FOLDERS\n" + "\n".join(sorted(map(str, selected))))
+        recycle = dialog.addButton("Recycle selected folders", QMessageBox.ButtonRole.AcceptRole)
+        cancel = dialog.addButton(QMessageBox.StandardButton.Cancel)
+        dialog.setDefaultButton(cancel)
+        dialog.exec()
+        if dialog.clickedButton() != recycle:
+            return
+        self.empty_folder_issues = []
+        self.start_job(
+            lambda **kwargs: recycle_empty_folders(folders, selected, **kwargs),
+            self.on_empty_folders_recycled, self.on_empty_folder_failure,
+        )
+
+    def on_empty_folders_recycled(self, result: EmptyFolderRecycleResult):
+        self.empty_folder_issues = result.issues
+        recycled = set(result.recycled)
+        self.set_empty_folders(
+            record for record in self.empty_folders if record.path not in recycled)
+        noun = "folder" if len(self.empty_folders) == 1 else "folders"
+        self.empty_folder_summary.setText(
+            f"{len(self.empty_folders):,} listed empty {noun} remaining · all checks cleared")
+        self.empty_folder_hint.setText(
+            "Rescan to refresh changed folders and discover parent folders that became empty.")
+        self.status.setText(
+            "Empty-folder cleanup cancelled; already recycled folders remain in the Recycle Bin."
+            if result.cancelled else
+            "Empty-folder cleanup complete. No permanent deletion was requested.")
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Empty-folder recycling results")
+        dialog.setText(
+            f"{len(result.recycled):,} folders recycled  ·  {len(result.issues):,} skipped / errors")
+        dialog.setInformativeText(
+            self.status.text() + "\nUnchecked and skipped paths remain listed. All checkboxes were cleared.")
+        dialog.setDetailedText("\n".join(
+            ["RECYCLED", *map(str, result.recycled), "", "SKIPPED / ERRORS",
+             *(f"{issue.path}: {issue.reason}" for issue in result.issues)]))
+        dialog.exec()
+
+    def on_empty_folder_failure(self, message):
+        self.set_empty_folders(self.empty_folders)
+        self.empty_folder_summary.setText(
+            "Operation stopped · empty-folder results may be out of date"
+            if self.empty_folders else "Empty-folder operation stopped")
+        self.empty_folder_hint.setText(
+            "Scan empty folders again before continuing. Check the Recycle Bin if cleanup was running.")
+        self.status.setText(message)
+        QMessageBox.critical(
+            self, "Empty-folder operation stopped",
+            message + "\n\nThe duplicate-file results were not changed.")
+
+    def confirm_recycle(self):
+        if self.worker is not None or not self.selected:
+            return
+        selected = frozenset(self.selected)
+        groups = tuple(self.groups)
+        amount = sum(self.records[path].size for path in selected)
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Confirm recycling")
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setText(f"Send {len(selected):,} selected files ({format_bytes(amount)}) to the Recycle Bin?")
+        information = "Only the files you checked will be recycled. Contents and file safety are rechecked before recycling.\n\nFiles that cannot be safely recycled will be skipped. Nothing is permanently deleted."
+        hidden = len(selected - self.visible_paths)
+        if hidden:
+            information = (f"Includes {hidden:,} selected file(s) hidden by the current tab or filters. "
+                           "Checked files from all tabs will be recycled. Review the full list in Show Details.\n\n" + information)
+        details = ["SELECTED FOR RECYCLING", *sorted(map(str, selected)), "", "COPIES KEPT IN AFFECTED GROUPS"]
+        all_copy_groups = 0
+        for number, group in enumerate(groups, 1):
+            if any(record.path in selected for record in group.files):
+                kept = [str(record.path) for record in group.files if record.path not in selected]
+                details.append(f"Group {number}")
+                details.extend(kept or ["NONE — every listed copy is selected for recycling."])
+                if not kept:
+                    all_copy_groups += 1
+        if all_copy_groups:
+            information = (f"WARNING: All copies selected in {all_copy_groups:,} group(s). "
+                           "No listed copy will be kept in those groups if recycling succeeds. "
+                           "You can restore them from the Recycle Bin until you empty it.\n\n" + information)
+        dialog.setInformativeText(information)
+        dialog.setDetailedText("\n".join(details))
+        recycle = dialog.addButton("Recycle selected files", QMessageBox.ButtonRole.AcceptRole)
+        cancel = dialog.addButton(QMessageBox.StandardButton.Cancel)
+        dialog.setDefaultButton(cancel)
+        dialog.exec()
+        if dialog.clickedButton() != recycle:
+            return
+        self.issues = []
+        self.start_job(lambda **kwargs: recycle_selected(groups, selected, **kwargs), self.on_recycled)
+
+    def on_recycled(self, result: RecycleResult):
+        self.issues = result.issues
+        recycled = set(result.recycled)
+        remaining_groups = []
+        for group in self.groups:
+            remaining_files = tuple(record for record in group.files if record.path not in recycled)
+            if len(remaining_files) > 1:
+                remaining_groups.append(DuplicateGroup(remaining_files, group.digest))
+        self.set_groups(remaining_groups)
+        savings = sum(group.extra_bytes for group in self.groups)
+        noun = "group" if len(self.groups) == 1 else "groups"
+        self.summary.setText(f"{len(self.groups):,} duplicate {noun} remaining  ·  {format_bytes(savings)} potentially recoverable")
+        self.empty.setText("No duplicate groups remain in these results. Groups with fewer than two copies are no longer listed. Scan again to check for new duplicates.")
+        self.status.setText("Cleanup cancelled; already recycled files remain in the Recycle Bin."
+                            if result.cancelled else "Cleanup complete. No permanent deletion was requested.")
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Recycling results")
+        dialog.setText(f"{len(result.recycled):,} files recycled  ·  {len(result.issues):,} skipped / errors")
+        dialog.setInformativeText(self.status.text() + "\nRemaining duplicate groups stay in the list. All checkboxes have been cleared so you can choose the next batch.")
+        dialog.setDetailedText("\n".join(
+            ["RECYCLED", *map(str, result.recycled), "", "SKIPPED / ERRORS",
+             *(f"{issue.path}: {issue.reason}" for issue in result.issues)]
+        ))
+        dialog.exec()
+
+    def on_failure(self, message):
+        self.set_groups(self.groups)
+        self.summary.setText("Operation stopped · results may be out of date" if self.groups else "Operation stopped")
+        self.empty.setText("Scan again before continuing. If cleanup was running, check the Recycle Bin for files already moved.")
+        self.status.setText(message)
+        details = message
+        if self.groups:
+            details += "\n\nThe list has been kept, but some files may already have been recycled. Check the Recycle Bin and scan again to refresh these results."
+        QMessageBox.critical(self, "Operation stopped", details)
+
+    def job_finished(self):
+        worker = self.worker
+        self.worker = None
+        if worker:
+            worker.deleteLater()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(100)
+        self.current_path.clear()
+        self.update_actions()
+        self.update_details()
+
+    def cancel_work(self):
+        if self.worker:
+            self.worker.cancel_event.set()
+            self.status.setText("Stopping safely after the current read or Windows operation…")
+            self.update_actions()
+
+    def show_issues(self):
+        self.show_issue_list("Skipped files and errors", self.issues)
+
+    def show_empty_folder_issues(self):
+        self.show_issue_list("Skipped folders and errors", self.empty_folder_issues)
+
+    def show_issue_list(self, title, issues):
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.resize(800, 480)
+        layout = QVBoxLayout(dialog)
+        text = QPlainTextEdit()
+        text.setReadOnly(True)
+        text.setPlainText("\n\n".join(f"{issue.path}\n{issue.reason}" for issue in issues))
+        layout.addWidget(text)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.exec()
+
+    def open_folder(self):
+        item = self.tree.currentItem()
+        if item is not None and item.parent() is not None:
+            record = item.data(0, Qt.ItemDataRole.UserRole)
+            if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(record.path.parent))):
+                QMessageBox.warning(self, "Could not open folder", str(record.path.parent))
+
+    def open_empty_folder(self, item, column=0):
+        if self.worker is not None or item is None:
+            return
+        record = item.data(0, Qt.ItemDataRole.UserRole)
+        try:
+            ensure_empty_folder_current(record)
+        except OSError as exc:
+            QMessageBox.warning(
+                self, "Cannot open this empty folder",
+                f"The folder changed, is no longer empty, or is unavailable. Scan again.\n\n{exc}")
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(record.path))):
+            QMessageBox.warning(self, "Could not open folder", str(record.path))
+
+    def closeEvent(self, event: QCloseEvent):
+        if self.worker is not None:
+            self.cancel_work()
+            event.ignore()
+            self.status.setText("Stopping safely. Close the window again once the operation has stopped.")
+        else:
+            self.thumbnails.close()
+            self.comparison_preview.close()
+            event.accept()
+
+
+def main():
+    app = QApplication.instance() or QApplication([])
+    app.setApplicationName("Duplicate Cleaner")
+    app.setStyle("Fusion")
+    window = MainWindow()
+    window.show()
+    return app.exec()
