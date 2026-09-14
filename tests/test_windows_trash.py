@@ -13,6 +13,24 @@ from tests.support import FileTestCase
 @unittest.skipUnless(os.name == "nt" and os.environ.get("DUPLICATE_CLEANER_RECYCLE_TEST") == "1",
                      "Set DUPLICATE_CLEANER_RECYCLE_TEST=1 for real Windows Shell tests on disposable files")
 class WindowsRecycleTests(FileTestCase):
+    def test_real_cleanup_recycles_files_with_named_streams(self):
+        for all_selected in (False, True):
+            with self.subTest(all_selected=all_selected):
+                folder = self.root / str(all_selected)
+                paths = [self.file(f"{all_selected}/copy-{index}.txt") for index in range(2)]
+                for path in paths:
+                    with open(str(path) + ":Zone.Identifier", "wb") as stream:
+                        stream.write(b"[ZoneTransfer]\r\nZoneId=3\r\n")
+                groups = scan([folder]).groups
+                targets = paths if all_selected else paths[:1]
+                result = recycle_selected(groups, targets)
+                self.assertFalse(result.issues, result.issues)
+                self.assertEqual(result.recycled, targets)
+                self.assertTrue(all(not path.exists() for path in targets))
+                if not all_selected:
+                    with open(str(paths[-1]) + ":Zone.Identifier", "rb") as stream:
+                        self.assertEqual(stream.read(), b"[ZoneTransfer]\r\nZoneId=3\r\n")
+
     def test_real_cleanup_recycles_a_disposable_empty_folder(self):
         target = self.root / "DuplicateCleaner-disposable-empty-folder"
         target.mkdir()

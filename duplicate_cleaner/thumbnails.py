@@ -114,7 +114,7 @@ class ThumbnailPopup(QFrame):
             self.note.setText(message or "No thumbnail available.")
         else:
             self.preview.setPixmap(QPixmap.fromImage(image))
-            self.note.setText(f"{format_bytes(record.size)} · Double-click the file to open")
+            self.note.setText(f"{format_bytes(record.total_size)} · Double-click the file to open")
         self.caption.setText(record.path.name)
         self.adjustSize()
         self.reposition()
@@ -287,6 +287,8 @@ def render_main():
         with _binary_pipe(sys.stdin, -10, "rb") as source, _binary_pipe(sys.stdout, -11, "wb") as output:
             fields = json.loads(source.read())
             fields["path"] = Path(fields["path"])
+            fields["streams"] = tuple(tuple(pair) for pair in fields.get("streams", ()))
+            fields["stream_hashes"] = tuple(tuple(pair) for pair in fields.get("stream_hashes", ()))
             output.write(render_thumbnail(FileRecord(**fields)))
     except Exception:
         return 1

@@ -4,15 +4,16 @@ from pathlib import Path
 from threading import Event
 from typing import Callable, Iterable
 
-from .files import ensure_current, ensure_no_extra_streams, open_checked, UnsafeFile
+from .files import ensure_current, open_checked, open_named_streams, UnsafeFile
 from .models import Cancelled, DuplicateGroup, Issue, Progress, RecycleResult
-from .scanner import compare_streams, Reporter
+from .scanner import compare_streams, differing_named_streams, Reporter
 from .windows_trash import recycle_file
 
 
 def recycle_selected(groups: Iterable[DuplicateGroup], selected: Iterable[Path], *,
                      cancel: Event | None = None,
                      progress: Callable[[Progress], None] | None = None,
+                     allow_zone_differences: bool = False,
                      recycler: Callable = recycle_file) -> RecycleResult:
     groups = tuple(groups)
     selected = {Path(os.path.abspath(path)) for path in selected}
@@ -41,29 +42,39 @@ def recycle_selected(groups: Iterable[DuplicateGroup], selected: Iterable[Path],
             try:
                 # Block writes throughout verification. If every copy is selected,
                 # the reference also permits recycling and is processed last.
-                with open_checked(reference, allow_delete=recycle_reference) as reference_stream:
+                with (open_checked(reference, allow_delete=recycle_reference) as reference_stream,
+                      open_named_streams(reference, allow_delete=recycle_reference) as reference_extra):
                     for record in targets:
                         reporter.check()
                         reporter.path = str(record.path)
                         try:
                             context = (nullcontext(reference_stream) if record is reference
                                        else open_checked(record, allow_delete=True))
-                            with context as target_stream:
+                            extra_context = (nullcontext(reference_extra) if record is reference
+                                             else open_named_streams(record, allow_delete=True))
+                            with context as target_stream, extra_context as target_extra:
                                 if record is reference:
                                     if not reference_verified:
                                         raise UnsafeFile("No matching copy could be reverified; scan again")
                                 else:
-                                    if not compare_streams(reference_stream, target_stream, reference.size, reporter):
+                                    if (reference.size != record.size
+                                            or not compare_streams(reference_stream, target_stream, reference.size, reporter)):
                                         label = "comparison copy" if recycle_reference else "remaining copy"
                                         raise UnsafeFile(f"Contents no longer match the {label}; scan again")
+                                    differences = differing_named_streams(
+                                        reference, reference_extra, record, target_extra, reporter)
+                                    other = {name for name in differences if name.casefold() != ":zone.identifier:$data"}
+                                    if other:
+                                        raise UnsafeFile("Extra NTFS data differs from the comparison copy; recycling blocked: "
+                                                         + ", ".join(sorted(other)))
+                                    if differences and not allow_zone_differences:
+                                        raise UnsafeFile("Download metadata (Zone.Identifier) differs; explicit confirmation is required")
                                     reference_verified = True
 
                                 def revalidate():
                                     reporter.check()
                                     ensure_current(reference)
                                     ensure_current(record)
-                                    ensure_no_extra_streams(reference.path)
-                                    ensure_no_extra_streams(record.path)
 
                                 revalidate()
                                 recycler(record.path, revalidate)

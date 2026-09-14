@@ -3,13 +3,13 @@ import os
 import re
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event
 from typing import Callable
 
-from .files import capture, ensure_no_extra_streams
+from .files import capture
 from .models import Cancelled, DuplicateGroup, FileRecord, Issue, Progress
 
 
@@ -82,6 +82,8 @@ def _record_json(record: FileRecord, selected: frozenset[Path]) -> dict:
         "changed_ns": record.changed_ns,
         "device": record.device,
         "inode": record.inode,
+        "streams": record.streams,
+        "stream_hashes": record.stream_hashes,
         "selected": record.path in selected,
     }
 
@@ -191,6 +193,29 @@ def _parse_record(value, label: str) -> tuple[FileRecord, bool]:
     selected = fields.get("selected")
     if not isinstance(selected, bool):
         raise SessionFormatError(f"{label}.selected must be true or false")
+    streams = []
+    for index, raw in enumerate(_list(fields.get("streams", []), f"{label}.streams")):
+        pair = _list(raw, f"{label}.streams[{index}]")
+        if len(pair) != 2:
+            raise SessionFormatError(f"{label}.streams entries must contain a name and size")
+        name = _string(pair[0], f"{label}.streams[{index}].name")
+        if not re.fullmatch(r":[^:\\/\x00]+:\$DATA", name):
+            raise SessionFormatError(f"{label}.streams contains an invalid stream name")
+        streams.append((name, _integer(pair[1], f"{label}.streams[{index}].size")))
+    if len({name for name, size in streams}) != len(streams):
+        raise SessionFormatError(f"{label}.streams repeats a stream name")
+    hashes = []
+    for raw in _list(fields.get("stream_hashes", []), f"{label}.stream_hashes"):
+        pair = _list(raw, f"{label}.stream_hashes entry")
+        if len(pair) != 2:
+            raise SessionFormatError(f"{label}.stream_hashes entries must contain a name and SHA-256")
+        name = _string(pair[0], f"{label}.stream_hashes name")
+        digest = _string(pair[1], f"{label}.stream_hashes digest")
+        if not DIGEST_PATTERN.fullmatch(digest):
+            raise SessionFormatError(f"{label}.stream_hashes has an invalid SHA-256")
+        hashes.append((name, digest))
+    if hashes and (len(hashes) != len(streams) or {name for name, digest in hashes} != {name for name, size in streams}):
+        raise SessionFormatError(f"{label}.stream_hashes must match the stream names without duplicates")
     record = FileRecord(
         _absolute_path(fields.get("path"), f"{label}.path"),
         _integer(fields.get("size"), f"{label}.size"),
@@ -198,6 +223,8 @@ def _parse_record(value, label: str) -> tuple[FileRecord, bool]:
         _integer(fields.get("changed_ns"), f"{label}.changed_ns"),
         _integer(fields.get("device"), f"{label}.device"),
         _integer(fields.get("inode"), f"{label}.inode", 1),
+        tuple(sorted(streams)),
+        tuple(sorted(hashes)),
     )
     return record, selected
 
@@ -284,10 +311,9 @@ def load_session(path: Path, *, cancel: Event | None = None,
                 _check(cancel)
                 try:
                     current = capture(record.path)
-                    ensure_no_extra_streams(record.path)
                     if current != record:
                         raise OSError("File changed or was replaced since the session was saved")
-                    current_records.append(current)
+                    current_records.append(replace(current, stream_hashes=record.stream_hashes))
                 except OSError as exc:
                     dropped_files += 1
                     validation_issues.append(Issue(record.path, f"Session validation: {exc}"))

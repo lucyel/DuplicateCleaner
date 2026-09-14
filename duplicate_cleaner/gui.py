@@ -1,5 +1,6 @@
 import os
 import re
+import shlex
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
@@ -12,7 +13,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QFileDialog, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
     QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
-    QSplitter, QStyle, QStyleOptionViewItem, QTabBar, QTabWidget, QTreeWidget, QTreeWidgetItem,
+    QSplitter, QStyle, QStyledItemDelegate, QStyleOptionViewItem, QTabBar, QTabWidget, QTreeWidget, QTreeWidgetItem,
     QToolButton, QVBoxLayout, QWidget,
 )
 
@@ -48,6 +49,30 @@ def file_type(path: Path) -> str:
     return next((name for name, extensions in FILE_TYPES.items() if extension in extensions), "Other")
 
 
+def parse_filter_terms(value: str, *, path: bool = False) -> tuple[tuple[str, bool], ...]:
+    lexer = shlex.shlex(value, posix=True)
+    lexer.whitespace = ","
+    lexer.whitespace_split = True
+    lexer.quotes = '"'
+    # Preserve Windows path separators and literal apostrophes/hash characters.
+    lexer.escape = ""
+    lexer.commenters = ""
+    terms = []
+    for term in lexer:
+        term = term.strip()
+        if not term:
+            continue
+        excluded = term.startswith("-")
+        if term[0] in "+-":
+            term = term[1:].strip()
+        if not term:
+            raise ValueError("Enter text after + or -.")
+        if path:
+            term = term.replace("\\", "/")
+        terms.append((term.casefold(), excluded))
+    return tuple(terms)
+
+
 STYLE = """
 QMainWindow, QDialog { background: #f4f6f9; }
 QWidget { color: #25334a; font-family: 'Segoe UI'; font-size: 10pt; }
@@ -58,6 +83,8 @@ QLabel#subtitle, QLabel#hint { color: #64748b; }
 QLabel#filterError { color: #b91c1c; }
 QLineEdit, QComboBox { background: white; border: 1px solid #ccd5e2; border-radius: 5px; padding: 5px; }
 QLabel#section { font-size: 12pt; font-weight: 600; }
+QLabel#metadataBadge { background: #dcfce7; color: #166534; border-radius: 6px; padding: 6px 10px; }
+QLabel#metadataBadge[warning="true"] { background: #fef3c7; color: #92400e; }
 QLabel#summary { background: white; border: 1px solid #e0e6ef; border-radius: 10px;
                   padding: 16px; font-size: 12pt; font-weight: 600; }
 QPushButton { background: white; border: 1px solid #ccd5e2; border-radius: 7px;
@@ -102,6 +129,8 @@ QFrame#sidebar { background: #0b1220; }
 QLabel#title { color: #f1f5f9; }
 QLabel#subtitle, QLabel#hint { color: #a5b4c8; }
 QLabel#filterError { color: #fca5a5; }
+QLabel#metadataBadge { background: #16372a; color: #86efac; }
+QLabel#metadataBadge[warning="true"] { background: #3b3520; color: #fde68a; }
 QLineEdit, QComboBox { background: #172235; border-color: #475569; }
 QLabel#summary { background: #1e293b; border-color: #334155; }
 QPushButton { background: #243247; border-color: #475569; }
@@ -164,14 +193,15 @@ def apply_theme(dark: bool):
     app.setStyleSheet(STYLE + (DARK_STYLE if dark else ""))
 
 
-def control_icon(kind: str, dark: bool) -> QIcon:
-    color = "#e2e8f0" if dark else "#25334a"
+def control_icon(kind: str, dark: bool, color: str | None = None) -> QIcon:
+    color = color or ("#e2e8f0" if dark else "#25334a")
     shapes = {
         "sun": '<circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2'
                'M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5"/>',
         "moon": '<path d="M20.5 14A9 9 0 0 1 10 3.5 9 9 0 1 0 20.5 14Z"/>',
         "search": '<circle cx="10.5" cy="10.5" r="6.5"/><path d="m15.5 15.5 5 5"/>',
         "checked": '<circle cx="12" cy="12" r="9"/><path d="m7.5 12 3 3 6-6"/>',
+        "all_checked": '<path d="m12 3 10 18H2Z M12 9v5 M12 17v.5"/>',
         "sidebar": '<rect x="3" y="4" width="18" height="16" rx="3"/>'
                    '<path d="M9 4v16M6 8v8"/>',
     }
@@ -213,7 +243,25 @@ class ResultItem(QTreeWidgetItem):
         return self.text(column).casefold() < other.text(column).casefold()
 
 
+class ResultDelegate(QStyledItemDelegate):
+    def paint(self, painter, option, index):
+        background = index.data(Qt.ItemDataRole.BackgroundRole)
+        if not index.parent().isValid() and background is not None and background.style() != Qt.BrushStyle.NoBrush:
+            # Keep checked-group colors visible while the group is the current row.
+            option = QStyleOptionViewItem(option)
+            self.initStyleOption(option, index)
+            option.state &= ~QStyle.StateFlag.State_Selected
+            style = option.widget.style() if option.widget else QApplication.style()
+            style.drawControl(QStyle.ControlElement.CE_ItemViewItem, option, painter, option.widget)
+        else:
+            super().paint(painter, option, index)
+
+
 class ResultTree(QTreeWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setItemDelegate(ResultDelegate(self))
+
     def mouseDoubleClickEvent(self, event):
         index = self.indexAt(event.position().toPoint())
         if index.isValid() and index.data(Qt.ItemDataRole.CheckStateRole) is not None:
@@ -397,7 +445,7 @@ class MainWindow(QMainWindow):
         self.summary.setWordWrap(True)
         content.addWidget(self.summary)
         results_heading = QHBoxLayout()
-        section = QLabel("Review identical files")
+        section = QLabel("Review matching files")
         section.setObjectName("section")
         results_heading.addWidget(section)
         results_heading.addStretch()
@@ -438,12 +486,19 @@ class MainWindow(QMainWindow):
             caption = QLabel(label)
             caption.setBuddy(field)
             field.setAccessibleName(label + " filter")
-            field.setPlaceholderText("Contains…")
+            field.setPlaceholderText("text, -exclude")
             field.setClearButtonEnabled(True)
-            field.setToolTip("Case-insensitive text match. All filled fields must match the same file in a group.")
+            field.setToolTip(
+                'Separate terms with commas; use -term to exclude. Matching ignores capitalization. '
+                'Spaces stay inside a term. Quote terms containing commas, such as "photos, 2026". '
+                'Use + before a term that literally starts with + or -. All terms apply to the same file.')
             field.returnPressed.connect(self.apply_result_filters)
             filter_layout.addWidget(caption, 0, column)
             filter_layout.addWidget(field, 1, column)
+        syntax_hint = QLabel("Separate terms with commas. Use -term to exclude. All terms must match.")
+        syntax_hint.setObjectName("hint")
+        syntax_hint.setWordWrap(True)
+        filter_layout.addWidget(syntax_hint, 2, 0, 1, 3)
         size_row = QHBoxLayout()
         self.min_size_filter = QLineEdit()
         self.max_size_filter = QLineEdit()
@@ -470,12 +525,12 @@ class MainWindow(QMainWindow):
         self.clear_filter_button.clicked.connect(self.clear_result_filters)
         size_row.addWidget(self.apply_filter_button)
         size_row.addWidget(self.clear_filter_button)
-        filter_layout.addLayout(size_row, 2, 0, 1, 3)
+        filter_layout.addLayout(size_row, 3, 0, 1, 3)
         self.filter_error = QLabel()
         self.filter_error.setObjectName("filterError")
         self.filter_error.setWordWrap(True)
         self.filter_error.hide()
-        filter_layout.addWidget(self.filter_error, 3, 0, 1, 3)
+        filter_layout.addWidget(self.filter_error, 4, 0, 1, 3)
         # Keep filters accessible even when the results/preview need horizontal scrolling.
         duplicate_layout.insertWidget(0, self.filter_panel)
         self.filter_panel.hide()
@@ -786,7 +841,7 @@ class MainWindow(QMainWindow):
         self.empty_folder_issue_button.setEnabled(bool(self.empty_folder_issues))
         self.empty_folder_issue_button.setText(
             f"Skipped folders / errors ({len(self.empty_folder_issues):,})")
-        amount = sum(self.records[path].size for path in self.selected)
+        amount = sum(self.records[path].total_size for path in self.selected)
         noun = "file" if len(self.selected) == 1 else "files"
         hidden = len(self.selected - self.visible_paths)
         suffix = f"  ·  {hidden:,} hidden by this tab or filters" if hidden else ""
@@ -812,14 +867,23 @@ class MainWindow(QMainWindow):
             self.filter_error.setText("Minimum size must not exceed maximum size. Filters were not changed.")
             self.filter_error.show()
             return
+        try:
+            text_filters = {
+                "filename": parse_filter_terms(self.filename_filter.text()),
+                "file_path": parse_filter_terms(self.file_path_filter.text(), path=True),
+                "folder_path": parse_filter_terms(self.folder_path_filter.text(), path=True),
+            }
+        except ValueError as exc:
+            self.filter_error.setText(
+                f"Invalid text filter: {exc} Use comma-separated terms and -term to exclude. Filters were not changed.")
+            self.filter_error.show()
+            return
         self.result_filters = {
-            "filename": self.filename_filter.text().strip().casefold(),
-            "file_path": self.file_path_filter.text().strip().replace("\\", "/").casefold(),
-            "folder_path": self.folder_path_filter.text().strip().replace("\\", "/").casefold(),
+            **{key: terms for key, terms in text_filters.items() if terms},
             "min_size": minimum, "max_size": maximum,
         }
         self.result_filters = {key: value for key, value in self.result_filters.items()
-                               if value is not None and value != ""}
+                               if value is not None}
         self.filter_error.hide()
         self.filter_results()
 
@@ -835,12 +899,17 @@ class MainWindow(QMainWindow):
         filters = self.result_filters
         if not filters:
             return True
+
+        def text_matches(key, value):
+            return all(query not in value if excluded else query in value
+                       for query, excluded in filters.get(key, ()))
+
         return any(
-            filters.get("filename", "") in record.path.name.casefold()
-            and filters.get("file_path", "") in record.path.as_posix().casefold()
-            and filters.get("folder_path", "") in record.path.parent.as_posix().casefold()
-            and (filters.get("min_size") is None or record.size >= filters["min_size"])
-            and (filters.get("max_size") is None or record.size <= filters["max_size"])
+            text_matches("filename", record.path.name.casefold())
+            and text_matches("file_path", record.path.as_posix().casefold())
+            and text_matches("folder_path", record.path.parent.as_posix().casefold())
+            and (filters.get("min_size") is None or record.total_size >= filters["min_size"])
+            and (filters.get("max_size") is None or record.total_size <= filters["max_size"])
             for record in group.files)
 
     def filter_results(self):
@@ -937,18 +1006,24 @@ class MainWindow(QMainWindow):
     def update_group_highlights(self):
         dark = self.dark_mode.isChecked()
         highlight = QBrush(QColor("#3b3520" if dark else "#fff1c2"))
+        all_highlight = QBrush(QColor("#53252d" if dark else "#fee2e2"))
         checked_icon = control_icon("checked", dark)
+        all_icon = control_icon("all_checked", dark, "#f87171" if dark else "#b91c1c")
         for index in range(self.tree.topLevelItemCount()):
             parent = self.tree.topLevelItem(index)
             group = parent.data(0, Qt.ItemDataRole.UserRole)
             checked = sum(record.path in self.selected for record in group.files)
+            all_checked = checked > 0 and checked == len(group.files)
+            background = all_highlight if all_checked else highlight if checked else QBrush()
             for column in range(self.tree.columnCount()):
-                parent.setBackground(column, highlight if checked else QBrush())
-            # The marker remains visible when the current-row color covers the highlight.
-            parent.setIcon(0, checked_icon if checked else QIcon())
+                parent.setBackground(column, background)
+            parent.setIcon(0, all_icon if all_checked else checked_icon if checked else QIcon())
             description = f"{checked} of {len(group.files)} files selected for recycling" if checked else ""
+            if all_checked:
+                description += ". All copies selected; no listed copy will remain."
             parent.setData(0, Qt.ItemDataRole.AccessibleDescriptionRole, description)
-            parent.setToolTip(0, f"Full SHA-256: {group.digest}" + (f"\n{description}" if checked else ""))
+            parent.setToolTip(0, f"{group.metadata_status}\nScan SHA-256: {group.digest}"
+                             + (f"\n{description}" if checked else ""))
 
     def start_job(self, job, handler, error_handler=None):
         self.thumbnails.clear()
@@ -1147,20 +1222,20 @@ class MainWindow(QMainWindow):
             self.tree.clear()
             for number, group in enumerate(groups, 1):
                 parent = ResultItem(self.tree, [
-                    f"Group {number} · {len(group.files)} identical files", "", "", "",
+                    f"Group {number} · {group.metadata_status} · {len(group.files)} files", "", "", "",
                 ])
                 parent.setData(2, Qt.ItemDataRole.UserRole, group.extra_bytes)
                 parent.setData(0, Qt.ItemDataRole.UserRole, group)
-                parent.setToolTip(0, f"Full SHA-256: {group.digest}")
+                parent.setToolTip(0, f"{group.metadata_status}\nScan SHA-256: {group.digest}")
                 font = QFont()
                 font.setBold(True)
                 parent.setFont(0, font)
                 for record in group.files:
                     modified = datetime.fromtimestamp(record.modified_ns / 1_000_000_000)
                     child = ResultItem(parent, [record.path.name, str(record.path),
-                                               format_bytes(record.size), modified.strftime("%Y-%m-%d %H:%M:%S")])
+                                               format_bytes(record.total_size), modified.strftime("%Y-%m-%d %H:%M:%S")])
                     child.setData(0, Qt.ItemDataRole.UserRole, record)
-                    child.setData(2, Qt.ItemDataRole.UserRole, record.size)
+                    child.setData(2, Qt.ItemDataRole.UserRole, record.total_size)
                     child.setFlags(child.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                     child.setCheckState(0, Qt.CheckState.Unchecked)
                     child.setToolTip(0, str(record.path))
@@ -1283,14 +1358,16 @@ class MainWindow(QMainWindow):
             f"Name: {record.path.name}",
             f"Type: {record.path.suffix.upper()[1:] + ' file' if record.path.suffix else 'No extension'}",
             f"Full path: {record.path}",
-            f"Size at scan: {format_bytes(record.size)} ({record.size:,} bytes)",
+            f"Size at scan: {format_bytes(record.total_size)} ({record.total_size:,} bytes)",
+            f"Extra NTFS streams: {len(record.streams)} ({record.total_size - record.size:,} bytes)",
             f"Modified at scan: {modified:%Y-%m-%d %H:%M:%S}",
             f"Created: {created.toString('yyyy-MM-dd HH:mm:ss') if created.isValid() else 'Unavailable'}",
-            f"Duplicate group: {len(group.files)} copies verified byte for byte at scan time",
+            f"Duplicate group: {len(group.files)} copies with main contents verified byte for byte at scan time",
             f"SHA-256 at scan: {group.digest}",
             f"Selection: {selection}",
             f"Current status: {state}",
         ]
+        lines.extend(("", group.metadata_details))
         self.details_text.setPlainText("\n".join(lines))
         was_hidden = self.details_panel.isHidden()
         self.details_panel.setVisible(self.preview_toggle.isChecked())
@@ -1483,7 +1560,7 @@ class MainWindow(QMainWindow):
             return
         selected = frozenset(self.selected)
         groups = tuple(self.groups)
-        amount = sum(self.records[path].size for path in selected)
+        amount = sum(self.records[path].total_size for path in selected)
         dialog = QMessageBox(self)
         dialog.setWindowTitle("Confirm recycling")
         dialog.setIcon(QMessageBox.Icon.Warning)
@@ -1495,6 +1572,8 @@ class MainWindow(QMainWindow):
                            "Checked files from all tabs will be recycled. Review the full list in Show Details.\n\n" + information)
         details = ["SELECTED FOR RECYCLING", *sorted(map(str, selected)), "", "COPIES KEPT IN AFFECTED GROUPS"]
         all_copy_groups = 0
+        zone_warning = False
+        other_warning = False
         for number, group in enumerate(groups, 1):
             if any(record.path in selected for record in group.files):
                 kept = [str(record.path) for record in group.files if record.path not in selected]
@@ -1502,6 +1581,23 @@ class MainWindow(QMainWindow):
                 details.extend(kept or ["NONE — every listed copy is selected for recycling."])
                 if not kept:
                     all_copy_groups += 1
+                differences = (group.differing_streams if group.metadata_checked else
+                               {name for record in group.files for name, size in record.streams})
+                zone_warning |= any(name.casefold() == ":zone.identifier:$data" for name in differences)
+                other_warning |= any(name.casefold() != ":zone.identifier:$data" for name in differences)
+                if differences:
+                    details.extend(("", group.metadata_details))
+        if other_warning:
+            information += ("\n\nSome extra NTFS streams differ or have not been checked. "
+                            "Files whose non-download streams differ from the comparison copy will be skipped.")
+        if zone_warning:
+            information += ("\n\nDownload metadata (Zone.Identifier) differs or has not been checked. "
+                            "Allowing this recycles the selected file with its own download metadata, "
+                            "even when that metadata differs or is absent in another copy. "
+                            "Retained files and their metadata stay unchanged. Leave unchecked to skip those differences.")
+            consent = QCheckBox("Allow differences in Zone.Identifier download metadata for this batch")
+            consent.setChecked(False)
+            dialog.setCheckBox(consent)
         if all_copy_groups:
             information = (f"WARNING: All copies selected in {all_copy_groups:,} group(s). "
                            "No listed copy will be kept in those groups if recycling succeeds. "
@@ -1514,8 +1610,9 @@ class MainWindow(QMainWindow):
         dialog.exec()
         if dialog.clickedButton() != recycle:
             return
+        options = {"allow_zone_differences": True} if zone_warning and consent.isChecked() else {}
         self.issues = []
-        self.start_job(lambda **kwargs: recycle_selected(groups, selected, **kwargs), self.on_recycled)
+        self.start_job(lambda **kwargs: recycle_selected(groups, selected, **options, **kwargs), self.on_recycled)
 
     def on_recycled(self, result: RecycleResult):
         self.issues = result.issues

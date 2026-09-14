@@ -1,6 +1,6 @@
 import os
 import stat
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 from pathlib import Path
 from typing import BinaryIO, Iterator
 
@@ -32,7 +32,7 @@ def capture(path: Path) -> FileRecord:
     if not info.st_ino:
         raise UnsafeFile("The filesystem did not provide a reliable file identity")
     return FileRecord(path, info.st_size, info.st_mtime_ns, info.st_ctime_ns,
-                      info.st_dev, info.st_ino)
+                      info.st_dev, info.st_ino, named_streams(path))
 
 
 def ensure_current(record: FileRecord) -> None:
@@ -40,9 +40,9 @@ def ensure_current(record: FileRecord) -> None:
         raise UnsafeFile("File changed or was replaced since discovery; scan again")
 
 
-def ensure_no_extra_streams(path: Path) -> None:
+def named_streams(path: Path) -> tuple[tuple[str, int], ...]:
     if os.name != "nt":
-        return
+        return ()
     import pywintypes
     import win32file
 
@@ -51,15 +51,12 @@ def ensure_no_extra_streams(path: Path) -> None:
     except pywintypes.error as exc:
         # FAT/exFAT do not support named streams. Other errors fail closed.
         if exc.winerror in (1, 38, 50):
-            return
+            return ()
         raise OSError(str(exc)) from exc
-    if any(name != "::$DATA" for size, name in streams):
-        raise UnsafeFile("File has extra NTFS data streams; skipped to preserve unverified data")
+    return tuple(sorted((name, size) for size, name in streams if name != "::$DATA"))
 
 
-@contextmanager
-def open_checked(record: FileRecord, allow_delete: bool = False) -> Iterator[BinaryIO]:
-    ensure_current(record)
+def _open_read(path: Path | str, allow_delete: bool) -> BinaryIO:
     if os.name == "nt":
         import msvcrt
         import pywintypes
@@ -71,7 +68,7 @@ def open_checked(record: FileRecord, allow_delete: bool = False) -> Iterator[Bin
             share |= win32con.FILE_SHARE_DELETE
         try:
             handle = win32file.CreateFile(
-                str(record.path), win32con.GENERIC_READ, share, None,
+                str(path), win32con.GENERIC_READ, share, None,
                 win32con.OPEN_EXISTING, win32con.FILE_FLAG_SEQUENTIAL_SCAN, None,
             )
         except pywintypes.error as exc:
@@ -82,15 +79,39 @@ def open_checked(record: FileRecord, allow_delete: bool = False) -> Iterator[Bin
             handle.Close()
             raise
         handle.Detach()  # The descriptor now owns the Windows handle.
-        stream = os.fdopen(descriptor, "rb")
-    else:
-        stream = record.path.open("rb")
-    with stream:
+        try:
+            return os.fdopen(descriptor, "rb")
+        except BaseException:
+            os.close(descriptor)
+            raise
+    return open(path, "rb")
+
+
+@contextmanager
+def open_checked(record: FileRecord, allow_delete: bool = False) -> Iterator[BinaryIO]:
+    ensure_current(record)
+    with _open_read(record.path, allow_delete) as stream:
         info = os.fstat(stream.fileno())
         if (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns) != (
             record.device, record.inode, record.size, record.modified_ns
         ):
             raise UnsafeFile("File changed while it was being opened")
         ensure_current(record)
-        ensure_no_extra_streams(record.path)
         yield stream
+
+
+@contextmanager
+def open_named_streams(record: FileRecord, allow_delete: bool = False) -> Iterator[dict[str, BinaryIO]]:
+    # Windows sharing locks apply per stream. Keep every named stream locked
+    # until comparison/recycling finishes, just like the main data stream.
+    ensure_current(record)
+    with ExitStack() as stack:
+        opened = {}
+        for name, size in record.streams:
+            stream = stack.enter_context(_open_read(str(record.path) + name, allow_delete))
+            info = os.fstat(stream.fileno())
+            if (info.st_dev, info.st_ino, info.st_size) != (record.device, record.inode, size):
+                raise UnsafeFile("NTFS data stream changed while it was being opened; scan again")
+            opened[name] = stream
+        ensure_current(record)
+        yield opened

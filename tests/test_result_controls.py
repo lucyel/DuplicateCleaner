@@ -46,6 +46,80 @@ class ResultControlTests(FileTestCase):
         self.window.deleteLater()
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
+    def test_stream_bytes_are_included_in_filters_rows_and_selection_totals(self):
+        if os.name != "nt":
+            self.skipTest("Windows NTFS streams")
+        for path in (self.cat, self.cat_copy):
+            with open(str(path) + ":extra", "wb") as stream:
+                stream.write(b"x" * 512)
+        self.window.on_scan(scan([self.root]))
+        self.window.size_unit.setCurrentText("B")
+        self.window.min_size_filter.setText("1536")
+        self.window.max_size_filter.setText("1536")
+        self.window.apply_filter_button.click()
+        self.assertEqual(self.window.visible_paths, {self.cat, self.cat_copy})
+        self.assertIn("1.50 KiB potentially recoverable", self.window.summary.text())
+        parent = self.group_item(self.cat)
+        child = parent.child(0)
+        self.assertEqual(child.text(2), "1.50 KiB")
+        child.setCheckState(0, Qt.CheckState.Checked)
+        self.assertIn("1.50 KiB", self.window.selection_label.text())
+
+    def test_metadata_badge_stream_details_and_explicit_batch_permission(self):
+        if os.name != "nt":
+            self.skipTest("Windows NTFS streams")
+        with open(str(self.cat) + ":Zone.Identifier", "wb") as stream:
+            stream.write(b"[ZoneTransfer]\r\nZoneId=3\r\n")
+        self.window.on_scan(scan([self.root]))
+        parent, gallery = self.show_gallery()
+        self.assertIn("Metadata differs", parent.text(0))
+        preview = self.window.comparison_preview
+        self.assertIn("Metadata differs", preview.metadata_badge.text())
+        preview.metadata_toggle.click()
+        self.assertFalse(preview.metadata_details.isHidden())
+        details = preview.metadata_details.toPlainText()
+        for text in (str(self.cat), str(self.cat_copy), "Zone.Identifier", "not present"):
+            self.assertIn(text, details)
+        parent.child(0).setCheckState(0, Qt.CheckState.Checked)
+        for consent in (False, True):
+            with self.subTest(consent=consent):
+                def accept(dialog):
+                    self.assertIn("Download metadata", dialog.informativeText())
+                    self.assertIsNotNone(dialog.checkBox())
+                    self.assertFalse(dialog.checkBox().isChecked())
+                    self.assertEqual(dialog.defaultButton(), dialog.button(QMessageBox.StandardButton.Cancel))
+                    dialog.checkBox().setChecked(consent)
+                    next(button for button in dialog.buttons()
+                         if dialog.buttonRole(button) == QMessageBox.ButtonRole.AcceptRole).click()
+                    return 0
+
+                with patch.object(QMessageBox, "exec", accept), patch.object(self.window, "start_job") as start:
+                    self.window.confirm_recycle()
+                with patch("duplicate_cleaner.gui.recycle_selected") as cleanup:
+                    start.call_args.args[0]()
+                self.assertEqual(cleanup.call_args.kwargs.get("allow_zone_differences", False), consent)
+        with patch.object(QMessageBox, "exec", return_value=0), patch.object(self.window, "start_job") as start:
+            self.window.confirm_recycle()
+        start.assert_not_called()
+
+    def test_custom_metadata_difference_has_no_download_override(self):
+        if os.name != "nt":
+            self.skipTest("Windows NTFS streams")
+        with open(str(self.cat) + ":custom", "wb") as stream:
+            stream.write(b"unique bytes")
+        self.window.on_scan(scan([self.root]))
+        parent = self.group_item(self.cat)
+        parent.child(0).setCheckState(0, Qt.CheckState.Checked)
+
+        def dismiss(dialog):
+            self.assertIn("non-download streams", dialog.informativeText())
+            self.assertIsNone(dialog.checkBox())
+            return 0
+
+        with patch.object(QMessageBox, "exec", dismiss), patch.object(self.window, "start_job") as start:
+            self.window.confirm_recycle()
+        start.assert_not_called()
+
     def group_item(self, path):
         return next(item.parent() for item in self.window.file_items()
                     if item.data(0, Qt.ItemDataRole.UserRole).path == path)
@@ -88,6 +162,97 @@ class ResultControlTests(FileTestCase):
         self.window.folder_path_filter.setText("photos")
         self.window.apply_filter_button.click()
         self.assertEqual(len(self.visible_groups()), 2)
+
+    def test_reverse_filename_filter_updates_groups_summary_and_preserves_checks(self):
+        parent, gallery = self.show_gallery()
+        gallery.item(0).setCheckState(Qt.CheckState.Checked)
+        selected = set(self.window.selected)
+        self.window.filename_filter.setText("-CAT")
+        self.window.apply_filter_button.click()
+        self.assertEqual(len(self.visible_groups()), 2)
+        self.assertNotIn(self.cat, self.window.visible_paths)
+        self.assertEqual(self.window.selected, selected)
+        self.assertEqual(self.window.summary.text(), "2 duplicate groups  ·  2.00 KiB potentially recoverable")
+        self.window.clear_filter_button.click()
+        self.assertEqual(len(self.visible_groups()), 3)
+        self.assertFalse(self.window.filename_filter.text())
+
+    def test_positive_and_negative_path_criteria_match_the_same_file(self):
+        self.window.filename_filter.setText("cat-copy")
+        self.window.folder_path_filter.setText("-BACKUP")
+        self.window.apply_filter_button.click()
+        self.assertFalse(self.visible_groups())
+        self.window.filename_filter.setText("cat")
+        self.window.apply_filter_button.click()
+        self.assertEqual(self.window.visible_paths, {self.cat, self.cat_copy})
+        self.window.file_path_filter.setText("-PHOTOS\\CAT.JPG")
+        self.window.apply_filter_button.click()
+        self.assertFalse(self.visible_groups())
+
+    def test_blank_reverse_filters_are_ignored_and_edits_require_apply(self):
+        self.window.filename_filter.setText(" , , ")
+        self.window.apply_filter_button.click()
+        self.assertFalse(self.window.result_filters)
+        self.assertEqual(len(self.visible_groups()), 3)
+        self.window.filename_filter.setText("-cat")
+        self.window.apply_filter_button.click()
+        self.assertEqual(len(self.visible_groups()), 2)
+        self.window.filename_filter.setText("cat")
+        self.assertEqual(len(self.visible_groups()), 2)
+        self.window.min_size_filter.setText("invalid")
+        self.window.apply_filter_button.click()
+        self.assertEqual(len(self.visible_groups()), 2)
+        self.assertEqual(self.window.result_filters["filename"], (("cat", True),))
+        self.window.min_size_filter.clear()
+        self.window.apply_filter_button.click()
+        self.assertEqual(self.window.visible_paths, {self.cat, self.cat_copy})
+
+    def test_multiple_includes_and_excludes_in_each_text_field(self):
+        self.window.filename_filter.setText("CAT, copy, -dog, -zero")
+        self.window.apply_filter_button.click()
+        self.assertEqual(self.window.visible_paths, {self.cat, self.cat_copy})
+        self.window.filename_filter.setText("cat, dog")
+        self.window.apply_filter_button.click()
+        self.assertFalse(self.visible_groups())
+        self.window.filename_filter.setText("cat, -copy, -jpg")
+        self.window.apply_filter_button.click()
+        self.assertFalse(self.visible_groups())
+        self.window.filename_filter.clear()
+        self.window.file_path_filter.setText("PHOTOS, CAT.JPG, -backup, -dog")
+        self.window.folder_path_filter.setText("photos, -backup, -empty")
+        self.window.apply_filter_button.click()
+        self.assertEqual(self.window.visible_paths, {self.cat, self.cat_copy})
+        self.window.folder_path_filter.setText("photos, backup")
+        self.window.apply_filter_button.click()
+        self.assertFalse(self.visible_groups())
+
+    def test_terms_preserve_spaces_quoted_commas_and_literal_leading_minus(self):
+        first = self.file("Summer photos/John's draft, final.txt", b"a new duplicate")
+        second = self.file("Backup/-draft.txt", b"a new duplicate")
+        self.window.on_scan(scan([self.root]))
+        self.window.filename_filter.setText('"draft, final", -copy')
+        self.window.folder_path_filter.setText("summer photos")
+        self.window.apply_filter_button.click()
+        self.assertEqual(self.window.visible_paths, {first, second})
+        self.window.folder_path_filter.clear()
+        self.window.filename_filter.setText("John's, draft")
+        self.window.apply_filter_button.click()
+        self.assertEqual(self.window.visible_paths, {first, second})
+        self.window.filename_filter.setText('draft, -"draft, final", --draft')
+        self.window.apply_filter_button.click()
+        self.assertFalse(self.visible_groups())
+        self.window.filename_filter.setText("+-draft")
+        self.window.apply_filter_button.click()
+        self.assertEqual(self.window.visible_paths, {first, second})
+
+    def test_invalid_terms_leave_previous_results_unchanged(self):
+        self.window.filename_filter.setText("cat")
+        self.window.apply_filter_button.click()
+        for value in ("-", "+", '"unfinished'):
+            self.window.filename_filter.setText(value)
+            self.window.apply_filter_button.click()
+            self.assertEqual(self.window.visible_paths, {self.cat, self.cat_copy})
+            self.assertFalse(self.window.filter_error.isHidden())
 
     def test_size_bounds_are_inclusive_support_decimals_and_zero(self):
         self.window.size_unit.setCurrentText("KiB")
@@ -232,8 +397,15 @@ class ResultControlTests(FileTestCase):
 
     def test_selecting_all_preview_copies_keeps_recycling_warning(self):
         parent, gallery = self.show_gallery()
+        gallery.item(0).setCheckState(Qt.CheckState.Checked)
+        partial_color = parent.background(0).color()
         for i in range(gallery.count()):
             gallery.item(i).setCheckState(Qt.CheckState.Checked)
+        self.assertNotEqual(parent.background(0).color(), partial_color)
+        self.assertIn("All copies selected", parent.toolTip(0))
+        gallery.item(0).setCheckState(Qt.CheckState.Unchecked)
+        self.assertEqual(parent.background(0).color(), partial_color)
+        gallery.item(0).setCheckState(Qt.CheckState.Checked)
         self.assertEqual(self.window.selected, {self.cat, self.cat_copy})
         with patch.object(QMessageBox, "exec", return_value=0):
             self.window.confirm_recycle()

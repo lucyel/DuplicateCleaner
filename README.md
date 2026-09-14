@@ -2,6 +2,16 @@
 
 A local Windows desktop app written in Python with PySide6. Scan one or more folders, review exact duplicates, and **manually check the individual files you want to send to the Windows Recycle Bin**. No file is selected automatically.
 
+## License
+
+The original source code and documentation in this repository are licensed under the [MIT License](LICENSE), copyright (c) 2026 lucyel. You may use, modify, and redistribute them, including commercially, provided you retain the copyright and license notice. The software is provided without warranty.
+
+Third-party dependencies retain their own licenses. In particular, [PySide6/Qt for Python](https://doc.qt.io/qtforpython-6/) offers LGPL/GPL and commercial licensing options; this project's MIT license does not relicense Qt. Python, pywin32, and other components bundled in an executable also retain their applicable notices and terms. [PyInstaller's license exception](https://pyinstaller.org/en/stable/license.html) permits packaging applications under other licenses.
+
+When distributing a portable executable, include this project's `LICENSE` and the applicable third-party license texts and notices. For LGPL components, also meet the applicable source-availability and modification/relinking requirements described in the [Qt LGPL license](https://doc.qt.io/qt-6/lgpl.html). Adding this source license does not certify the existing one-file executable's distribution compliance; a complete bundled-component review remains necessary before publishing a binary release.
+
+See [the preliminary IP search](IP_REVIEW.md) for related duplicate-detection patent publications and the limits of that search. The MIT license does not establish patent clearance.
+
 ## Start the app
 
 ### Portable Windows executable
@@ -55,9 +65,13 @@ Click the **magnifying-glass icon** beside the theme icon to show the filters; t
 
 Click **Apply** or press Enter in a field. A group is shown when at least one file meets every filled criterion. Its other copies remain available for comparison and selection; existing file-type tabs still restrict which file rows are shown. **Clear filters** removes these criteria. Invalid sizes leave the previous filter unchanged. Filters use scan-time metadata, do not change files, and are not saved in session files.
 
+Enter multiple comma-separated terms in any text field. Plain terms must be present; prefix a term with **-** to exclude it. For example, **photo, holiday, -backup** requires both “photo” and “holiday” and excludes “backup,” ignoring capitalization. All terms across all fields apply to the same file; blank terms are ignored. Matching groups retain all their copies for comparison, including copies that do not meet the filter.
+
+Spaces stay inside a term, so **summer photos** searches that whole phrase. Quote a term containing a comma, such as **"photos, 2026"**. To search for a literal leading minus or plus, prefix it with **+**, such as **+-draft**. Click **Apply** or press Enter to apply edits; malformed terms leave the previous results unchanged.
+
 Filtering preserves checked files, including files in hidden groups. The selection count and recycling confirmation report hidden checks. Use **Clear file selection** to uncheck files across all groups and filters.
 
-A group containing checked files has an amber highlight and a checkmark beside its title, even when collapsed. The marker disappears when the group's last checked file is unchecked. This follows selections made in either the list or the preview.
+A group with some files checked has an amber highlight and a checkmark beside its title, even when collapsed. When every file is checked, the group turns red and shows a warning icon to indicate that no listed copy will remain. Unchecking one file changes it back to amber; unchecking every file removes the highlight. These indicators follow selections made in either the list or the preview and remain visible on the current group.
 
 The top summary shows the number of currently visible groups and their potentially recoverable size. These totals update when applying or clearing filters or switching tabs. Recovery estimates include all copies in each matching group, even when a file-type tab hides some copies.
 
@@ -113,10 +127,10 @@ Candidates pass through all of these stages:
 
 1. Same byte length (only a filter).
 2. Matching SHA-256 signatures of samples from the beginning, middle, and end (only a filter).
-3. Matching SHA-256 hashes of the **entire** file.
+3. Matching SHA-256 hashes of the entire main file contents. Named NTFS streams are hashed separately to identify metadata differences without hiding matching pictures or other files.
 4. Direct **byte-for-byte comparison**, including an end-of-file check.
 
-Matching hashes alone never establish duplication. Even an artificial hash collision is split into separate groups by the final comparison. Empty files can form duplicate groups but recover zero bytes.
+Matching main-content hashes alone never establish duplication. Even an artificial hash collision is split into separate groups by the final comparison. Files with empty main contents can form duplicate groups; any named-stream bytes still count toward their size.
 
 Reads use 1 MiB chunks, with 64 KiB samples. File contents are not loaded wholesale into memory. Reads are sequential rather than aggressively parallel to avoid thrashing hard drives. Memory still grows with the number of discovered files and displayed results. Scanning hundreds of GB is an intended use case, not a measured performance claim; timing depends on storage, file count, and duplication.
 
@@ -125,15 +139,16 @@ Reads use 1 MiB chunks, with 64 KiB samples. File contents are not loaded wholes
 - Scanning is read-only. There is no automatic selection, permanent-delete command, or permanent-delete fallback.
 - Overlapping folder selections are deduplicated by filesystem identity.
 - Symbolic links, junctions, other reparse points, offline/cloud-only files, and **all files with multiple hard links** are skipped conservatively.
-- Files with named NTFS alternate data streams are excluded during content verification. This includes files with a `Zone.Identifier` stream, often attached to downloads. Extra streams are not compared, so such files must not be recycled as verified duplicates. The reason appears in **Skipped files / errors**. The app does not remove these streams.
+- Duplicate groups match the main file contents byte for byte. **Exact match** means the extra stream names, sizes, and content hashes match too; **Metadata differs** means a stream is missing or different in another copy. The preview's **Show stream details** lists each file's stream names, sizes, and differences. Older saved sessions without stream hashes show **Metadata not checked — rescan**. Unreadable or changing streams are reported in **Skipped files / errors**.
+- Recycling rechecks the main contents and all extra streams byte for byte. A difference only in `Zone.Identifier` download metadata can be accepted using the unchecked-by-default **Allow differences in Zone.Identifier download metadata for this batch** checkbox in the recycling confirmation. Without that explicit consent, differing download metadata blocks the affected file. Consent applies only to that batch, is not saved, and never allows differences in other NTFS streams or in the main contents. Files whose other streams differ from the comparison copy are skipped. No metadata is stripped or merged; retained files remain unchanged, and selected files are recycled with their own streams.
 - Files without a reliable filesystem identity, inaccessible files, and files detected changing during verification are not accepted as duplicates.
-- When a copy is left unchecked, each selected file is compared byte for byte against it. The unchecked copy stays open under a Windows read lock that blocks writes and deletion throughout that group's cleanup. The selected file also blocks writes while being checked and recycled.
+- When a copy is left unchecked, each selected file is compared byte for byte against it, including every named stream. The unchecked copy and its streams stay open under Windows read locks that block writes and deletion throughout that group's cleanup. The selected file and its streams also block writes while being checked and recycled.
 - When **every copy is selected**, one selected file serves as the temporary comparison reference and is recycled last. Its handle blocks writes throughout the operation while permitting recycling. Every other file is compared byte for byte against it; the reference itself can be recycled only after at least one comparison succeeds. A group with no reverified match is skipped.
 - Identity, size, timestamps, path safety, and alternate streams are checked again immediately before every Windows Shell operation, including recycling the last copy. If the comparison reference is inaccessible or changed, that group's cleanup is skipped; the app does not silently choose different files to delete.
 - Windows `IFileOperation` requests recycling, disables connected-file operations, and uses a native callback to veto permanent deletion. A successful result must report a Recycle Bin destination. Unsupported locations, disabled/full bins, or other Windows errors are reported without a deletion fallback.
 - These checks are not a transactional filesystem snapshot. Windows recycles by path: another process that deliberately renames/replaces paths in the small interval after the final callback can still race the operation. Avoid scanning folders actively being modified or synchronized. The app is not designed to defend against malicious concurrent filesystem changes or kernel-level tools.
 - Do not clean application installations or system directories merely because their files have matching contents. Different applications can require identical files at different paths. Choose personal data folders and review paths before confirming.
-- Group savings estimate the logical bytes recovered by keeping one copy. The selected-file total includes every checked file, including the last copy if selected. Compression, sparse files, and filesystem deduplication can make actual disk savings smaller.
+- File sizes, size filters, scan totals, and group savings include the main content plus named-stream bytes. When copies have different stream sizes, potential group savings assume the largest copy is kept. This is an estimate before recycling safety checks; blocked files do not free space. The selected-file total includes every checked file, including the last copy if selected. Compression, sparse files, and filesystem deduplication can make actual disk savings smaller.
 - Cancelling a scan discards partial results. Cancelling cleanup stops subsequent work but does not undo files already recycled. If an unexpected error stops cleanup before a report is available, the list is kept and marked as potentially out of date; inspect the Recycle Bin and rescan.
 
 ## Verification

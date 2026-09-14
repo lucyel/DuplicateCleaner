@@ -52,6 +52,8 @@ class SessionTests(FileTestCase):
             fields = asdict(record)
             fields["path"] = str(record.path)
             fields["selected"] = record.path in selected
+            fields["streams"] = [list(pair) for pair in record.streams]
+            fields["stream_hashes"] = [list(pair) for pair in record.stream_hashes]
             expected_files.append(fields)
         self.assertEqual(payload["version"], 1)
         self.assertEqual(payload["groups"], [{"digest": group.digest, "files": expected_files}])

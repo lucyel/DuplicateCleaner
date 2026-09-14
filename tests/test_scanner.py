@@ -202,7 +202,7 @@ class ScannerTests(FileTestCase):
         self.assertEqual(result.file_count, 2)
         self.assertTrue(result.issues)
 
-    def test_named_streams_are_skipped_on_windows(self):
+    def test_main_duplicates_with_unmatched_named_stream_are_flagged(self):
         if os.name != "nt":
             self.skipTest("Windows NTFS test")
         original = self.file("a")
@@ -210,8 +210,9 @@ class ScannerTests(FileTestCase):
         with open(str(original) + ":extra", "wb") as stream:
             stream.write(b"not part of the main content")
         result = scan([self.root])
-        self.assertFalse(result.groups)
-        self.assertTrue(any("data streams" in issue.reason for issue in result.issues))
+        self.assertEqual(len(result.groups), 1)
+        self.assertEqual(result.groups[0].metadata_status, "Metadata differs")
+        self.assertFalse(result.issues, result.issues)
 
     def test_windows_reader_blocks_concurrent_writes(self):
         if os.name != "nt":

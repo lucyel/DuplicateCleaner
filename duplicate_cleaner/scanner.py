@@ -1,12 +1,13 @@
 import hashlib
 import os
 from collections import defaultdict
+from dataclasses import replace
 from pathlib import Path
 from threading import Event
 from time import monotonic
 from typing import BinaryIO, Callable, Iterable
 
-from .files import capture, check_location, ensure_current, open_checked, UnsafeFile
+from .files import capture, check_location, ensure_current, open_checked, open_named_streams, UnsafeFile
 from .models import Cancelled, DuplicateGroup, FileRecord, Issue, Progress, ScanResult
 
 CHUNK_SIZE = 1024 * 1024
@@ -61,8 +62,8 @@ def sample_digest(record: FileRecord, reporter: Reporter) -> bytes:
 
 def full_digest(record: FileRecord, reporter: Reporter) -> bytes:
     digest = hashlib.sha256()
-    count = 0
     with open_checked(record) as stream:
+        count = 0
         while data := reporter.read(stream, CHUNK_SIZE):
             digest.update(data)
             count += len(data)
@@ -70,6 +71,22 @@ def full_digest(record: FileRecord, reporter: Reporter) -> bytes:
             raise UnsafeFile("File length changed during hashing")
         ensure_current(record)
     return digest.digest()
+
+
+def hash_named_streams(record: FileRecord, reporter: Reporter) -> tuple[tuple[str, str], ...]:
+    hashes = []
+    with open_checked(record), open_named_streams(record) as extra:
+        for name, size in record.streams:
+            digest = hashlib.sha256()
+            count = 0
+            while data := reporter.read(extra[name], CHUNK_SIZE):
+                digest.update(data)
+                count += len(data)
+            if count != size:
+                raise UnsafeFile("NTFS data stream length changed during hashing")
+            hashes.append((name, digest.hexdigest()))
+        ensure_current(record)
+    return tuple(hashes)
 
 
 def compare_streams(left: BinaryIO, right: BinaryIO, size: int, reporter: Reporter) -> bool:
@@ -89,11 +106,25 @@ def compare_streams(left: BinaryIO, right: BinaryIO, size: int, reporter: Report
 
 
 def identical(left: FileRecord, right: FileRecord, reporter: Reporter) -> bool:
+    if left.size != right.size:
+        return False
     with open_checked(left) as first, open_checked(right) as second:
         same = compare_streams(first, second, left.size, reporter)
         ensure_current(left)
         ensure_current(right)
         return same
+
+
+def differing_named_streams(left: FileRecord, first: dict[str, BinaryIO],
+                            right: FileRecord, second: dict[str, BinaryIO], reporter: Reporter) -> set[str]:
+    left_sizes, right_sizes = dict(left.streams), dict(right.streams)
+    different = set()
+    for name in sorted(left_sizes.keys() | right_sizes.keys()):
+        reporter.check()
+        if (name not in left_sizes or name not in right_sizes or left_sizes[name] != right_sizes[name]
+                or not compare_streams(first[name], second[name], left_sizes[name], reporter)):
+            different.add(name)
+    return different
 
 
 def scan(roots: Iterable[Path | str], recursive: bool = True, *,
@@ -147,7 +178,7 @@ def scan(roots: Iterable[Path | str], recursive: bool = True, *,
                             seen_files.add(identity)
                             by_size[record.size].append(record)
                             result.file_count += 1
-                            result.total_bytes += record.size
+                            result.total_bytes += record.total_size
                             reporter.completed = result.file_count
                         except OSError as exc:
                             result.issues.append(Issue(path, str(exc)))
@@ -174,6 +205,8 @@ def scan(roots: Iterable[Path | str], recursive: bool = True, *,
                     reporter.path = str(record.path)
                     try:
                         digest = digest_function(record, reporter)
+                        if stage == "Hashing full contents" and record.streams:
+                            record = replace(record, stream_hashes=hash_named_streams(record, reporter))
                         buckets[digest].append(record)
                     except OSError as exc:
                         result.issues.append(Issue(record.path, str(exc)))

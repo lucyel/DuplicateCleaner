@@ -11,7 +11,7 @@ from PySide6.QtGui import QDesktopServices, QIcon, QImage, QImageReader, QPainte
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QGraphicsScene, QGraphicsView, QHBoxLayout, QLabel,
     QListView, QListWidget, QListWidgetItem,
-    QPushButton, QSizePolicy, QStackedWidget, QStyle, QVBoxLayout, QWidget,
+    QPlainTextEdit, QPushButton, QSizePolicy, QStackedWidget, QStyle, QVBoxLayout, QWidget,
 )
 
 from .files import ensure_current, open_checked
@@ -61,6 +61,8 @@ def render_main():
             fields = json.loads(source.read())
             preview_size = fields.pop("preview_size", None)
             fields["path"] = Path(fields["path"])
+            fields["streams"] = tuple(tuple(pair) for pair in fields.get("streams", ()))
+            fields["stream_hashes"] = tuple(tuple(pair) for pair in fields.get("stream_hashes", ()))
             metadata, data = render_preview(FileRecord(**fields), preview_size)
         except Exception as exc:
             metadata, data = {"error": str(exc)}, b""
@@ -238,7 +240,7 @@ class PreviewPane(QWidget):
                 dimensions = "Thumbnail preview · "
             elif self.metadata.get("reduced"):
                 dimensions += "Reduced preview · "
-        self.info.setText(f"{dimensions}{format_bytes(self.record.size)}\n{state}")
+        self.info.setText(f"{dimensions}{format_bytes(self.record.total_size)}\n{state}")
         self.path.setText(self.path.fontMetrics().elidedText(
             str(self.record.path), Qt.TextElideMode.ElideMiddle, max(80, self.path.width())))
         self.path.setToolTip(str(self.record.path))
@@ -391,7 +393,7 @@ class GroupGallery(QListWidget):
                 checked = record.path in selected
                 state = "Selected for recycling" if checked else "Unchecked"
                 self.item(index).setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
-                self.item(index).setText(f"{record.path.name}\n{format_bytes(record.size)} · {state}")
+                self.item(index).setText(f"{record.path.name}\n{format_bytes(record.total_size)} · {state}")
         finally:
             self.blockSignals(blocked)
         self.refresh_timer.start(0)
@@ -469,6 +471,25 @@ class ComparisonPreview(QWidget):
         self.anchor = None
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        self.metadata_badge = QLabel()
+        self.metadata_badge.setObjectName("metadataBadge")
+        self.metadata_badge.setTextFormat(Qt.TextFormat.PlainText)
+        self.metadata_badge.setWordWrap(True)
+        layout.addWidget(self.metadata_badge)
+        self.metadata_toggle = QPushButton("Show stream details")
+        self.metadata_toggle.setCheckable(True)
+        layout.addWidget(self.metadata_toggle)
+        self.metadata_details = QPlainTextEdit()
+        self.metadata_details.setReadOnly(True)
+        self.metadata_details.setAccessibleName("NTFS stream differences by file")
+        self.metadata_details.setMaximumHeight(160)
+        layout.addWidget(self.metadata_details)
+        self.metadata_toggle.toggled.connect(self.metadata_details.setVisible)
+        self.metadata_toggle.toggled.connect(lambda checked: self.metadata_toggle.setText(
+            "Hide stream details" if checked else "Show stream details"))
+        self.metadata_details.hide()
+        self.metadata_badge.hide()
+        self.metadata_toggle.hide()
         self.stack = QStackedWidget()
         layout.addWidget(self.stack)
         self.gallery = GroupGallery()
@@ -486,6 +507,17 @@ class ComparisonPreview(QWidget):
 
     def set_group(self, group, anchor, selected):
         files = group.files
+        self.metadata_badge.setText(group.metadata_status + " · Main file contents match")
+        warning = group.metadata_status != "Exact match"
+        if self.metadata_badge.property("warning") != warning:
+            self.metadata_badge.setProperty("warning", warning)
+            self.metadata_badge.style().unpolish(self.metadata_badge)
+            self.metadata_badge.style().polish(self.metadata_badge)
+        self.metadata_badge.show()
+        has_streams = any(record.streams for record in files)
+        self.metadata_toggle.setVisible(has_streams)
+        self.metadata_details.setPlainText(group.metadata_details)
+        self.metadata_details.setVisible(has_streams and self.metadata_toggle.isChecked())
         changed = files != self.files or anchor != self.anchor
         self.files, self.anchor = files, anchor
         if anchor is None:
@@ -528,6 +560,10 @@ class ComparisonPreview(QWidget):
 
     def clear(self):
         self.files, self.anchor = (), None
+        self.metadata_badge.hide()
+        self.metadata_toggle.hide()
+        self.metadata_details.hide()
+        self.metadata_details.clear()
         self.gallery.clear()
         for pane in self.panes:
             pane.set_record(None)

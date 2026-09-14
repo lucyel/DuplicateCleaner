@@ -146,7 +146,7 @@ class CleanupTests(FileTestCase):
         result = recycle_selected(groups, paths, recycler=recycler)
         self.assertEqual(result.recycled, paths[:1])
         self.assertEqual([issue.path for issue in result.issues], paths[1:])
-        self.assertRegex(result.issues[0].reason, "File changed|extra NTFS data streams")
+        self.assertIn("File changed", result.issues[0].reason)
         self.assertTrue(paths[-1].exists())
 
     def test_unknown_selection_is_rejected_before_any_action(self):
