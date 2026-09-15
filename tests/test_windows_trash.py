@@ -13,6 +13,18 @@ from tests.support import FileTestCase
 @unittest.skipUnless(os.name == "nt" and os.environ.get("DUPLICATE_CLEANER_RECYCLE_TEST") == "1",
                      "Set DUPLICATE_CLEANER_RECYCLE_TEST=1 for real Windows Shell tests on disposable files")
 class WindowsRecycleTests(FileTestCase):
+    def test_real_cleanup_recycles_when_keeper_has_additional_dropbox_stream(self):
+        selected = self.file("selected-disposable.jpg")
+        kept = self.file("keeper-with-dropbox-metadata.jpg")
+        with open(str(kept) + ":com.dropbox.attrs", "wb") as stream:
+            stream.write(b"additional metadata")
+        result = recycle_selected(scan([self.root]).groups, [selected])
+        self.assertFalse(result.issues, result.issues)
+        self.assertEqual(result.recycled, [selected])
+        self.assertFalse(selected.exists())
+        with open(str(kept) + ":com.dropbox.attrs", "rb") as stream:
+            self.assertEqual(stream.read(), b"additional metadata")
+
     def test_real_cleanup_recycles_files_with_named_streams(self):
         for all_selected in (False, True):
             with self.subTest(all_selected=all_selected):

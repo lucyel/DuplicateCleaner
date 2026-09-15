@@ -98,6 +98,7 @@ class ResultControlTests(FileTestCase):
                 with patch("duplicate_cleaner.gui.recycle_selected") as cleanup:
                     start.call_args.args[0]()
                 self.assertEqual(cleanup.call_args.kwargs.get("allow_zone_differences", False), consent)
+                self.assertFalse(cleanup.call_args.kwargs.get("allow_dropbox_differences", False))
         with patch.object(QMessageBox, "exec", return_value=0), patch.object(self.window, "start_job") as start:
             self.window.confirm_recycle()
         start.assert_not_called()
@@ -112,13 +113,79 @@ class ResultControlTests(FileTestCase):
         parent.child(0).setCheckState(0, Qt.CheckState.Checked)
 
         def dismiss(dialog):
-            self.assertIn("non-download streams", dialog.informativeText())
+            self.assertIn("other streams", dialog.informativeText())
             self.assertIsNone(dialog.checkBox())
             return 0
 
         with patch.object(QMessageBox, "exec", dismiss), patch.object(self.window, "start_job") as start:
             self.window.confirm_recycle()
         start.assert_not_called()
+
+    def test_app_recycles_selected_copy_when_unchecked_copy_has_dropbox_metadata(self):
+        if os.name != "nt":
+            self.skipTest("Windows NTFS streams")
+        with open(str(self.cat_copy) + ":com.dropbox.attrs", "wb") as stream:
+            stream.write(b"keeper-only metadata")
+        self.window.on_scan(scan([self.root]))
+        item = next(item for item in self.window.file_items()
+                    if item.data(0, Qt.ItemDataRole.UserRole).path == self.cat)
+        item.setCheckState(0, Qt.CheckState.Checked)
+
+        def accept(dialog):
+            self.assertIn("only on a kept comparison copy do not block", dialog.informativeText())
+            self.assertIsNone(dialog.checkBox())
+            next(button for button in dialog.buttons()
+                 if dialog.buttonRole(button) == QMessageBox.ButtonRole.AcceptRole).click()
+            return 0
+
+        with patch.object(QMessageBox, "exec", accept), patch.object(self.window, "start_job") as start:
+            self.window.confirm_recycle()
+        calls = []
+
+        def recycler(path, revalidate):
+            revalidate()
+            calls.append(path)
+
+        result = start.call_args.args[0](recycler=recycler)
+        self.assertEqual(calls, [self.cat])
+        self.assertEqual(result.recycled, [self.cat])
+        self.assertFalse(result.issues, result.issues)
+
+    def test_dropbox_metadata_consent_is_explicit_scoped_and_reset_for_each_batch(self):
+        if os.name != "nt":
+            self.skipTest("Windows NTFS streams")
+        with open(str(self.cat) + ":com.dropbox.attrs", "wb") as stream:
+            stream.write(b"selected file metadata")
+        for with_zone in (False, True):
+            if with_zone:
+                with open(str(self.cat) + ":Zone.Identifier", "wb") as stream:
+                    stream.write(b"download metadata")
+            self.window.on_scan(scan([self.root]))
+            item = next(item for item in self.window.file_items()
+                        if item.data(0, Qt.ItemDataRole.UserRole).path == self.cat)
+            item.setCheckState(0, Qt.CheckState.Checked)
+            for allowed in (True, False):
+                with self.subTest(with_zone=with_zone, allowed=allowed):
+                    def accept(dialog):
+                        self.assertIn("Dropbox metadata", dialog.informativeText())
+                        self.assertIn("com.dropbox.attrs", dialog.checkBox().text())
+                        self.assertEqual("Zone.Identifier" in dialog.checkBox().text(), with_zone)
+                        self.assertFalse(dialog.checkBox().isChecked())
+                        self.assertEqual(dialog.defaultButton(), dialog.button(QMessageBox.StandardButton.Cancel))
+                        dialog.checkBox().setChecked(allowed)
+                        next(button for button in dialog.buttons()
+                             if dialog.buttonRole(button) == QMessageBox.ButtonRole.AcceptRole).click()
+                        return 0
+
+                    with patch.object(QMessageBox, "exec", accept), patch.object(self.window, "start_job") as start:
+                        self.window.confirm_recycle()
+                    recycler = Mock()
+                    result = start.call_args.args[0](recycler=recycler)
+                    self.assertEqual(result.recycled, [self.cat] if allowed else [])
+                    self.assertEqual(recycler.call_count, int(allowed))
+            with patch.object(QMessageBox, "exec", return_value=0), patch.object(self.window, "start_job") as start:
+                self.window.confirm_recycle()
+            start.assert_not_called()
 
     def group_item(self, path):
         return next(item.parent() for item in self.window.file_items()

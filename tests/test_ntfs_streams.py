@@ -231,8 +231,14 @@ class NtfsStreamTests(FileTestCase):
                 result = scan([selected.parent])
                 self.assertEqual(result.groups[0].metadata_status, "Metadata differs")
                 denied = Mock()
-                self.assertFalse(recycle_selected(result.groups, [selected], recycler=denied).recycled)
-                denied.assert_not_called()
+                without_override = recycle_selected(result.groups, [selected], recycler=denied)
+                if selected_zone is None:
+                    self.assertEqual(without_override.recycled, [selected])
+                    self.assertFalse(without_override.issues)
+                    denied.assert_called_once()
+                else:
+                    self.assertFalse(without_override.recycled)
+                    denied.assert_not_called()
                 original = capture(kept)
 
                 def recycler(path, revalidate):
@@ -248,6 +254,149 @@ class NtfsStreamTests(FileTestCase):
                         self.assertEqual(stream.read(), kept_zone)
                 with open(str(kept) + ":other", "rb") as stream:
                     self.assertEqual(stream.read(), b"same extra data")
+
+    def test_batch_recycles_copies_when_kept_file_has_extra_dropbox_data(self):
+        paths = [self.file(f"copy-{i}.jpg") for i in range(4)]
+        kept = paths[-1]
+        for path in paths[1:]:
+            self.add_stream(path, "shared", b"shared data")
+        self.add_stream(kept, "com.dropbox.attrs", b"keeper-only dropbox metadata")
+        self.add_stream(kept, "empty", b"")
+        groups = scan([self.root]).groups
+        before = capture(kept)
+
+        def recycler(path, revalidate):
+            with self.assertRaises(OSError):
+                self.add_stream(kept, "com.dropbox.attrs", b"must remain locked")
+            with self.assertRaises(OSError):
+                kept.unlink()
+            revalidate()
+            path.rename(path.with_suffix(".recycled-fixture"))
+
+        result = recycle_selected(groups, paths[:-1], recycler=recycler)
+        self.assertEqual(result.recycled, paths[:-1])
+        self.assertFalse(result.issues, result.issues)
+        self.assertEqual(capture(kept), before)
+        with open(str(kept) + ":com.dropbox.attrs", "rb") as stream:
+            self.assertEqual(stream.read(), b"keeper-only dropbox metadata")
+        self.assertEqual(kept.read_bytes(), b"identical content")
+
+    def test_selected_dropbox_metadata_requires_approval_and_is_preserved_when_recycled(self):
+        for index, kept_metadata in enumerate((None, b"different metadata")):
+            with self.subTest(kept_metadata=kept_metadata):
+                selected = self.file(f"{index}/selected.jpg")
+                kept = self.file(f"{index}/kept.jpg")
+                self.add_stream(selected, "com.dropbox.attrs", b"selected metadata")
+                if kept_metadata is not None:
+                    self.add_stream(kept, "com.dropbox.attrs", kept_metadata)
+                groups = scan([selected.parent]).groups
+                denied = Mock()
+                result = recycle_selected(groups, [selected], allow_zone_differences=True, recycler=denied)
+                self.assertFalse(result.recycled)
+                self.assertIn("Dropbox metadata", result.issues[0].reason)
+                denied.assert_not_called()
+                before = capture(kept)
+                destination = selected.with_suffix(".recycled-fixture")
+
+                def recycler(path, revalidate):
+                    with self.assertRaises(OSError):
+                        self.add_stream(path, "com.dropbox.attrs", b"must stay locked")
+                    revalidate()
+                    path.rename(destination)
+
+                result = recycle_selected(groups, [selected], allow_dropbox_differences=True, recycler=recycler)
+                self.assertEqual(result.recycled, [selected])
+                self.assertFalse(result.issues, result.issues)
+                self.assertEqual(capture(kept), before)
+                with open(str(destination) + ":com.dropbox.attrs", "rb") as stream:
+                    self.assertEqual(stream.read(), b"selected metadata")
+
+    def test_dropbox_approval_does_not_allow_zone_or_other_stream_differences(self):
+        for index, stream_name in enumerate(("Zone.Identifier", "custom", "com.dropbox.attributes")):
+            with self.subTest(stream_name=stream_name):
+                selected = self.file(f"{index}/selected")
+                kept = self.file(f"{index}/kept")
+                self.add_stream(selected, "com.dropbox.attrs", b"Dropbox metadata")
+                self.add_stream(selected, stream_name, b"other unique data")
+                groups = scan([selected.parent]).groups
+                recycler = Mock()
+                result = recycle_selected(groups, [selected], allow_dropbox_differences=True,
+                                          allow_zone_differences=stream_name != "Zone.Identifier", recycler=recycler)
+                self.assertFalse(result.recycled)
+                self.assertIn(stream_name, result.issues[0].reason)
+                recycler.assert_not_called()
+
+    def test_dropbox_approval_does_not_allow_changed_main_contents(self):
+        paths = self.copies()
+        self.add_stream(paths[0], "com.dropbox.attrs", b"extra metadata")
+        group = scan([self.root]).groups[0]
+        paths[0].write_bytes(b"different content")
+        group = replace(group, files=tuple(capture(path) for path in paths))
+        recycler = Mock()
+        result = recycle_selected([group], paths[:1], allow_dropbox_differences=True, recycler=recycler)
+        self.assertFalse(result.recycled)
+        self.assertIn("Contents no longer match", result.issues[0].reason)
+        recycler.assert_not_called()
+
+    def test_all_selected_dropbox_differences_require_approval_before_last_copy(self):
+        paths = [self.file(f"copy-{index}") for index in range(3)]
+        for index, path in enumerate(paths):
+            self.add_stream(path, "com.dropbox.attrs", bytes([index]))
+        groups = scan([self.root]).groups
+        denied = Mock()
+        self.assertFalse(recycle_selected(groups, paths, recycler=denied).recycled)
+        denied.assert_not_called()
+
+        def recycler(path, revalidate):
+            revalidate()
+            path.rename(path.with_suffix(".recycled-fixture"))
+
+        result = recycle_selected(groups, paths, allow_dropbox_differences=True, recycler=recycler)
+        self.assertEqual(result.recycled, paths)
+        self.assertFalse(result.issues, result.issues)
+
+    def test_extra_keeper_stream_does_not_allow_losing_selected_stream_data(self):
+        for index, (selected_data, kept_data) in enumerate(((b"unique", None), (b"unique", b"others"))):
+            with self.subTest(kept_data=kept_data):
+                selected = self.file(f"{index}/selected")
+                kept = self.file(f"{index}/kept")
+                self.add_stream(selected, "custom", selected_data)
+                if kept_data is not None:
+                    self.add_stream(kept, "custom", kept_data)
+                self.add_stream(kept, "com.dropbox.attrs", b"additional data")
+                recycler = Mock()
+                result = recycle_selected(scan([selected.parent]).groups, [selected],
+                                          allow_zone_differences=True, recycler=recycler)
+                self.assertFalse(result.recycled)
+                self.assertIn(":custom:$DATA", result.issues[0].reason)
+                recycler.assert_not_called()
+
+    def test_extra_streams_are_not_ignored_when_every_copy_is_selected(self):
+        for index in (0, 1):
+            with self.subTest(stream_on=index):
+                paths = [self.file(f"{index}/copy-{number}") for number in range(2)]
+                self.add_stream(paths[index], "com.dropbox.attrs", b"extra data")
+                recycler = Mock()
+                result = recycle_selected(scan([paths[0].parent]).groups, paths,
+                                          allow_zone_differences=True, recycler=recycler)
+                self.assertFalse(result.recycled)
+                self.assertEqual(len(result.issues), 2)
+                recycler.assert_not_called()
+
+    def test_changed_keeper_inventory_still_blocks_before_recycling(self):
+        selected, kept = self.file("selected"), self.file("kept")
+        self.add_stream(kept, "com.dropbox.attrs", b"extra data")
+        groups = scan([self.root]).groups
+
+        def recycler(path, revalidate):
+            self.add_stream(kept, "new-stream", b"changed after comparison")
+            revalidate()
+            self.fail("Recycling must stop when the keeper changes")
+
+        result = recycle_selected(groups, [selected], recycler=recycler)
+        self.assertFalse(result.recycled)
+        self.assertIn("File changed", result.issues[0].reason)
+        self.assertTrue(selected.exists())
 
     def test_all_selected_zone_differences_need_approval_including_last_copy(self):
         paths = self.copies(3)

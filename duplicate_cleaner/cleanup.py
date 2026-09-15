@@ -14,6 +14,7 @@ def recycle_selected(groups: Iterable[DuplicateGroup], selected: Iterable[Path],
                      cancel: Event | None = None,
                      progress: Callable[[Progress], None] | None = None,
                      allow_zone_differences: bool = False,
+                     allow_dropbox_differences: bool = False,
                      recycler: Callable = recycle_file) -> RecycleResult:
     groups = tuple(groups)
     selected = {Path(os.path.abspath(path)) for path in selected}
@@ -63,12 +64,22 @@ def recycle_selected(groups: Iterable[DuplicateGroup], selected: Iterable[Path],
                                         raise UnsafeFile(f"Contents no longer match the {label}; scan again")
                                     differences = differing_named_streams(
                                         reference, reference_extra, record, target_extra, reporter)
-                                    other = {name for name in differences if name.casefold() != ":zone.identifier:$data"}
+                                    if not recycle_reference:
+                                        # The unchecked reference remains: extra data found only
+                                        # on that copy is preserved and cannot be lost here.
+                                        # Keep the symmetric check when every copy is selected.
+                                        differences.intersection_update(target_extra)
+                                    other = {name for name in differences if name.casefold() not in
+                                             {":zone.identifier:$data", ":com.dropbox.attrs:$data"}}
                                     if other:
                                         raise UnsafeFile("Extra NTFS data differs from the comparison copy; recycling blocked: "
                                                          + ", ".join(sorted(other)))
-                                    if differences and not allow_zone_differences:
+                                    if (any(name.casefold() == ":zone.identifier:$data" for name in differences)
+                                            and not allow_zone_differences):
                                         raise UnsafeFile("Download metadata (Zone.Identifier) differs; explicit confirmation is required")
+                                    if (any(name.casefold() == ":com.dropbox.attrs:$data" for name in differences)
+                                            and not allow_dropbox_differences):
+                                        raise UnsafeFile("Dropbox metadata (com.dropbox.attrs) differs; explicit confirmation is required")
                                     reference_verified = True
 
                                 def revalidate():

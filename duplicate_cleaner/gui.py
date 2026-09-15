@@ -1573,6 +1573,8 @@ class MainWindow(QMainWindow):
         details = ["SELECTED FOR RECYCLING", *sorted(map(str, selected)), "", "COPIES KEPT IN AFFECTED GROUPS"]
         all_copy_groups = 0
         zone_warning = False
+        dropbox_warning = False
+        keeper_extra_warning = False
         other_warning = False
         for number, group in enumerate(groups, 1):
             if any(record.path in selected for record in group.files):
@@ -1583,19 +1585,39 @@ class MainWindow(QMainWindow):
                     all_copy_groups += 1
                 differences = (group.differing_streams if group.metadata_checked else
                                {name for record in group.files for name, size in record.streams})
-                zone_warning |= any(name.casefold() == ":zone.identifier:$data" for name in differences)
-                other_warning |= any(name.casefold() != ":zone.identifier:$data" for name in differences)
                 if differences:
                     details.extend(("", group.metadata_details))
+                if kept:
+                    selected_streams = {name for record in group.files if record.path in selected
+                                        for name, size in record.streams}
+                    keeper_extra_warning |= bool(set(differences) - selected_streams)
+                    differences = set(differences) & selected_streams
+                zone_warning |= any(name.casefold() == ":zone.identifier:$data" for name in differences)
+                dropbox_warning |= any(name.casefold() == ":com.dropbox.attrs:$data" for name in differences)
+                other_warning |= any(name.casefold() not in {":zone.identifier:$data", ":com.dropbox.attrs:$data"}
+                                     for name in differences)
+        if keeper_extra_warning:
+            information += "\n\nExtra streams found only on a kept comparison copy do not block recycling."
         if other_warning:
             information += ("\n\nSome extra NTFS streams differ or have not been checked. "
-                            "Files whose non-download streams differ from the comparison copy will be skipped.")
+                            "Extra streams found only on a kept comparison copy do not block recycling. "
+                            "Selected files whose other streams are missing or different in that copy will be skipped. "
+                            "If every copy is selected, other streams must match.")
         if zone_warning:
             information += ("\n\nDownload metadata (Zone.Identifier) differs or has not been checked. "
                             "Allowing this recycles the selected file with its own download metadata, "
                             "even when that metadata differs or is absent in another copy. "
-                            "Retained files and their metadata stay unchanged. Leave unchecked to skip those differences.")
-            consent = QCheckBox("Allow differences in Zone.Identifier download metadata for this batch")
+                            "Retained files and their metadata stay unchanged. Leave unchecked to block loss of differing "
+                            "download metadata. Extra metadata found only on a kept comparison copy is allowed without this option.")
+        if dropbox_warning:
+            information += ("\n\nDropbox metadata (com.dropbox.attrs) differs or has not been checked. "
+                            "Allowing this recycles each selected file with its own Dropbox metadata, even when "
+                            "another copy lacks that metadata or stores different bytes. Metadata unique to the selected "
+                            "copy may then exist only in the Recycle Bin. Retained files stay unchanged.")
+        if zone_warning or dropbox_warning:
+            names = " and ".join(name for enabled, name in (
+                (zone_warning, "Zone.Identifier"), (dropbox_warning, "com.dropbox.attrs")) if enabled)
+            consent = QCheckBox(f"Allow differences in {names} metadata for this batch")
             consent.setChecked(False)
             dialog.setCheckBox(consent)
         if all_copy_groups:
@@ -1610,7 +1632,12 @@ class MainWindow(QMainWindow):
         dialog.exec()
         if dialog.clickedButton() != recycle:
             return
-        options = {"allow_zone_differences": True} if zone_warning and consent.isChecked() else {}
+        options = {}
+        if (zone_warning or dropbox_warning) and consent.isChecked():
+            if zone_warning:
+                options["allow_zone_differences"] = True
+            if dropbox_warning:
+                options["allow_dropbox_differences"] = True
         self.issues = []
         self.start_job(lambda **kwargs: recycle_selected(groups, selected, **options, **kwargs), self.on_recycled)
 
