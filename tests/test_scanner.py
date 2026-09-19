@@ -1,14 +1,76 @@
 import os
 import weakref
+from dataclasses import replace
 from threading import Event
 from unittest.mock import patch
 
 from duplicate_cleaner.files import capture, open_checked
+from duplicate_cleaner.models import SearchCriteria
 from duplicate_cleaner.scanner import scan, SAMPLE_SIZE
 from tests.support import FileTestCase
 
 
 class ScannerTests(FileTestCase):
+    def test_size_only_groups_different_contents_without_reading_them(self):
+        paths = {self.file("a.txt", b"aaa"), self.file("b.bin", b"bbb")}
+        self.file("other", b"longer")
+        with patch("duplicate_cleaner.scanner.sample_digest") as sample, \
+                patch("duplicate_cleaner.scanner.full_digest") as full:
+            result = scan([self.root], criteria=SearchCriteria(contents=False, hashes=False))
+        sample.assert_not_called()
+        full.assert_not_called()
+        self.assertEqual(len(result.groups), 1)
+        group = result.groups[0]
+        self.assertEqual({record.path for record in group.files}, paths)
+        self.assertIsNone(group.digest)
+        self.assertIn("Possible match", group.metadata_status)
+        self.assertNotIn("match byte for byte", group.metadata_details)
+
+    def test_filename_only_allows_different_sizes_and_ignores_case(self):
+        paths = {self.file("one/Photo.JPG", b"a"), self.file("two/photo.jpg", b"longer")}
+        self.file("three/other.jpg", b"a")
+        criteria = SearchCriteria(contents=False, hashes=False, size=False, filename=True)
+        result = scan([self.root], criteria=criteria)
+        self.assertEqual({record.path for record in result.groups[0].files}, paths)
+        self.assertFalse(scan([self.root], criteria=replace(criteria, size=True)).groups)
+
+    def test_content_and_name_criteria_preserve_byte_verification(self):
+        paths = {self.file("one/a.txt", b"aaa"), self.file("two/A.TXT", b"aaa")}
+        self.file("three/a.txt", b"bbb")
+        self.file("four/renamed.txt", b"aaa")
+        result = scan([self.root], criteria=SearchCriteria(filename=True, size=False))
+        self.assertEqual(len(result.groups), 1)
+        self.assertEqual({record.path for record in result.groups[0].files}, paths)
+        self.assertTrue(result.groups[0].contents_verified)
+
+    def test_extension_and_modified_time_are_additional_restrictions(self):
+        paths = {self.file("a.JPG", b"aaa"), self.file("b.jpg", b"aaa")}
+        self.file("c.bin", b"aaa")
+        later = self.file("d.jpg", b"aaa")
+        for path in paths:
+            os.utime(path, ns=(1_700_000_000_000_000_000,) * 2)
+        os.utime(later, ns=(1_700_000_001_000_000_000,) * 2)
+        result = scan([self.root], criteria=SearchCriteria(extension=True, modified=True))
+        self.assertEqual({record.path for record in result.groups[0].files}, paths)
+
+    def test_empty_criteria_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "at least one"):
+            scan([self.root], criteria=SearchCriteria(contents=False, hashes=False, size=False))
+
+    def test_matching_named_streams_can_be_required_with_or_without_main_contents(self):
+        if os.name != "nt":
+            self.skipTest("Windows NTFS streams")
+        paths = [self.file(name, b"same") for name in ("a", "b", "c", "d")]
+        for path, extra in zip(paths[:3], (b"one", b"one", b"two")):
+            with open(str(path) + ":extra", "wb") as stream:
+                stream.write(extra)
+        for contents in (True, False):
+            with self.subTest(contents=contents):
+                result = scan([self.root], criteria=SearchCriteria(contents=contents, streams=True))
+                self.assertEqual(len(result.groups), 1)
+                self.assertEqual({record.path for record in result.groups[0].files}, set(paths[:2]))
+                self.assertEqual(result.groups[0].contents_verified, contents)
+
     def test_excluded_subtrees_are_not_read_even_as_overlapping_roots(self):
         from duplicate_cleaner import scanner
 

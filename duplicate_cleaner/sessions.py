@@ -14,7 +14,7 @@ from .models import Cancelled, DuplicateGroup, FileRecord, Issue, Progress
 
 
 FORMAT_NAME = "duplicate-cleaner-session"
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 
@@ -116,7 +116,10 @@ def save_session(path: Path, data: SessionData, *, cancel: Event | None = None,
                 files.append(_record_json(record, data.selected))
                 completed += 1
                 reporter.emit(completed, str(record.path))
-            groups.append({"digest": group.digest, "files": files})
+            fields = {"digest": group.digest, "files": files}
+            if group.byte_verified is not None:
+                fields["byte_verified"] = group.byte_verified
+            groups.append(fields)
         issues = []
         for issue in data.issues:
             _check(cancel)
@@ -239,7 +242,7 @@ def load_session(path: Path, *, cancel: Event | None = None,
             payload = _mapping(json.load(source), "Session")
         if payload.get("format") != FORMAT_NAME:
             raise SessionFormatError("This is not a Duplicate Cleaner session")
-        if payload.get("version") != FORMAT_VERSION:
+        if payload.get("version") not in (1, FORMAT_VERSION):
             raise SessionFormatError(
                 f"Unsupported session version: {payload.get('version')!r}; expected {FORMAT_VERSION}")
         saved_at = _string(payload.get("saved_at"), "saved_at")
@@ -271,9 +274,14 @@ def load_session(path: Path, *, cancel: Event | None = None,
         seen_identities = set()
         for group_index, raw_group in enumerate(raw_groups):
             group_fields = _mapping(raw_group, f"groups[{group_index}]")
-            digest = _string(group_fields.get("digest"), f"groups[{group_index}].digest").casefold()
-            if not DIGEST_PATTERN.fullmatch(digest):
-                raise SessionFormatError(f"groups[{group_index}].digest is not a SHA-256 value")
+            digest = group_fields.get("digest")
+            if digest is not None or "digest" not in group_fields:
+                digest = _string(digest, f"groups[{group_index}].digest").casefold()
+                if not DIGEST_PATTERN.fullmatch(digest):
+                    raise SessionFormatError(f"groups[{group_index}].digest is not a SHA-256 value")
+            byte_verified = group_fields.get("byte_verified")
+            if byte_verified is not None and type(byte_verified) is not bool:
+                raise SessionFormatError(f"groups[{group_index}].byte_verified must be boolean")
             raw_files = _list(group_fields.get("files"), f"groups[{group_index}].files")
             if len(raw_files) < 2:
                 raise SessionFormatError(f"groups[{group_index}] has fewer than two files")
@@ -288,7 +296,7 @@ def load_session(path: Path, *, cancel: Event | None = None,
                 records.append(record)
                 if selected:
                     stored_selected.add(record.path)
-            parsed_groups.append(DuplicateGroup(tuple(records), digest))
+            parsed_groups.append(DuplicateGroup(tuple(records), digest, byte_verified))
 
         saved_issues = []
         for index, raw_issue in enumerate(_list(payload.get("issues"), "issues")):
@@ -320,7 +328,7 @@ def load_session(path: Path, *, cancel: Event | None = None,
                 completed += 1
                 reporter.emit(completed, str(record.path))
             if len(current_records) > 1:
-                valid_groups.append(DuplicateGroup(tuple(current_records), group.digest))
+                valid_groups.append(replace(group, files=tuple(current_records)))
                 valid_selected.update(record.path for record in current_records
                                       if record.path in stored_selected)
             else:

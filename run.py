@@ -13,6 +13,10 @@ if __name__ == "__main__":
         from duplicate_cleaner.preview import render_main
         raise SystemExit(render_main())
 
+    if sys.argv[1:] == ["--image-fingerprint"]:
+        from duplicate_cleaner.similarity import fingerprint_main
+        raise SystemExit(fingerprint_main())
+
     from duplicate_cleaner.gui import main
 
     raise SystemExit(main())

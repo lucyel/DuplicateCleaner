@@ -27,8 +27,8 @@ class GuiTests(FileTestCase):
             self.assertFalse(self.window.dark_mode.icon().isNull())
             self.assertEqual(self.window.dark_mode.accessibleName(),
                              "Switch to light mode" if dark else "Switch to dark mode")
-            self.assertFalse(self.window.sidebar_toggle.icon().isNull())
-            self.assertEqual(self.window.sidebar_toggle.arrowType(), Qt.ArrowType.NoArrow)
+            self.assertFalse(self.window.filter_toggle.icon().isNull())
+            self.assertEqual(self.window.filter_toggle.arrowType(), Qt.ArrowType.NoArrow)
 
     def test_exclusion_picker_and_removal_control_scan_scope(self):
         folder = str(self.root / "Backup")
@@ -102,6 +102,7 @@ class GuiTests(FileTestCase):
         self.file("Backup/meeting-notes-copy.txt", b"meeting notes\n" * 100)
         self.file("Archive/meeting-notes.txt", b"meeting notes\n" * 100)
         self.window = MainWindow()
+        self.window.workflow_tabs.setCurrentWidget(self.window.duplicate_page)
         self.addCleanup(self.window.settings.sync)
         self.window.add_folder_path(str(self.root))
         self.window.on_scan(scan([self.root]))
@@ -553,34 +554,104 @@ class GuiTests(FileTestCase):
             self.window.show_result_menu(self.window.tree.viewport().rect().bottomLeft())
         menu.assert_not_called()
 
-    def test_sidebar_icon_restores_panel_width_and_preserves_selection(self):
+    def test_initial_tab_is_scan_location_and_filters_open_duplicate_files(self):
+        window = MainWindow()
+        try:
+            self.assertIs(window.workflow_tabs.currentWidget(), window.location_page)
+            window.filter_toggle.setChecked(True)
+            self.assertIs(window.workflow_tabs.currentWidget(), window.duplicate_page)
+            self.assertFalse(window.filter_panel.isHidden())
+        finally:
+            window.close()
+
+    def test_scan_tabs_preserve_results_and_move_folder_controls_out_of_results(self):
         self.window.show()
         self.app.processEvents()
         item = self.window.tree.topLevelItem(0).child(0)
         item.setCheckState(0, Qt.CheckState.Checked)
         selected = set(self.window.selected)
         groups = list(self.window.groups)
-        sidebar_width = self.window.sidebar_container.width()
-        results_width = self.window.workflow_tabs.width()
-        self.assertEqual(self.window.sidebar_toggle.text(), "")
-        self.assertGreater(self.window.sidebar_toggle.x(), self.window.sidebar.geometry().right())
+        self.assertEqual([self.window.workflow_tabs.tabText(i) for i in range(5)],
+                         ["Scan location", "Search criteria", "Duplicate files", "Similar files", "Empty folders"])
+        self.assertTrue(self.window.location_page.isAncestorOf(self.window.folders))
+        self.assertTrue(self.window.location_page.isAncestorOf(self.window.excluded_folders))
+        self.assertFalse(self.window.folders.isVisible())
         for dark in (False, True):
             self.window.dark_mode.setChecked(dark)
-            QTest.mouseClick(self.window.sidebar_toggle, Qt.MouseButton.LeftButton)
-            QTest.qWait(20)
-            self.assertTrue(self.window.sidebar.isHidden())
-            self.assertTrue(self.window.sidebar_toggle.isVisible())
-            self.assertEqual(self.window.sidebar_toggle.accessibleName(), "Show sidebar")
-            self.assertGreater(self.window.workflow_tabs.width(), results_width)
-            self.assertTrue(self.window.grab().save(str(self.root.parent / f"gui-sidebar-hidden-{dark}.png")))
-            QTest.mouseClick(self.window.sidebar_toggle, Qt.MouseButton.LeftButton)
-            QTest.qWait(20)
-            self.assertFalse(self.window.sidebar.isHidden())
-            self.assertEqual(self.window.sidebar_toggle.accessibleName(), "Hide sidebar")
-            self.assertAlmostEqual(self.window.sidebar_container.width(), sidebar_width, delta=2)
+            for index in (0, 1, 3, 4, 2):
+                self.window.workflow_tabs.setCurrentIndex(index)
+                QTest.qWait(20)
+                self.assertEqual(self.window.scan_button.isVisible(), index != 3)
+                self.assertEqual(self.window.folders.isVisible(), index == 0)
         self.assertEqual(self.window.selected, selected)
         self.assertEqual(self.window.groups, groups)
         self.assertEqual(self.window.folders.count(), 1)
+
+    def test_search_criteria_are_captured_before_scan_and_disabled_during_work(self):
+        for check in self.window.criteria_checks.values():
+            check.setChecked(False)
+        self.assertFalse(self.window.scan_button.isEnabled())
+        with patch.object(self.window, "start_job") as start:
+            self.window.start_scan()
+        start.assert_not_called()
+        self.window.criteria_checks["filename"].setChecked(True)
+        self.assertTrue(self.window.scan_button.isEnabled())
+        self.window.workflow_tabs.setCurrentWidget(self.window.criteria_scroll)
+        with patch.object(self.window, "start_job") as start:
+            self.window.start_scan()
+        self.assertIs(self.window.workflow_tabs.currentWidget(), self.window.duplicate_page)
+        job = start.call_args.args[0]
+        self.window.criteria_checks["contents"].setChecked(True)
+        with patch("duplicate_cleaner.gui.scan") as scanner:
+            job()
+        criteria = scanner.call_args.kwargs["criteria"]
+        self.assertTrue(criteria.filename)
+        self.assertFalse(criteria.contents)
+        self.assertFalse(criteria.size)
+        self.window.worker = Mock()
+        try:
+            self.window.update_actions()
+            self.assertFalse(self.window.criteria_page.isEnabled())
+        finally:
+            self.window.worker = None
+            self.window.update_actions()
+
+    def test_extended_criteria_enable_dependencies_and_reach_scanner(self):
+        checks = self.window.criteria_checks
+        self.assertFalse(self.window.size_tolerance.isEnabled())
+        checks["contents"].setChecked(False)
+        checks["hashes"].setChecked(False)
+        self.assertTrue(self.window.size_tolerance.isEnabled())
+        for name in ("filename", "similar_names", "ignore_copy", "created", "created_date_only",
+                     "modified", "modified_date_only", "same_drive", "folder", "folder_depth_enabled",
+                     "from_search_root", "ignore_same_folder", "case_sensitive"):
+            checks[name].setChecked(True)
+        size_values = (16, 2, 1)
+        for widget, value in zip((self.window.size_tolerance, self.window.folder_depth,
+                                  self.window.text_tolerance), size_values):
+            self.assertTrue(widget.isEnabled())
+            widget.setValue(value)
+        with patch.object(self.window, "start_job") as start:
+            self.window.start_scan()
+        with patch("duplicate_cleaner.gui.scan") as scanner:
+            start.call_args.args[0]()
+        criteria = scanner.call_args.kwargs["criteria"]
+        self.assertEqual((criteria.size_tolerance, criteria.folder_depth, criteria.text_tolerance), size_values)
+        self.assertTrue(criteria.created_date_only and criteria.modified_date_only and criteria.ignore_copy)
+        self.assertTrue(criteria.folder and criteria.from_search_root and criteria.ignore_same_folder)
+        checks["folder"].setChecked(False)
+        checks["created"].setChecked(False)
+        self.assertFalse(self.window.folder_depth.isEnabled())
+        self.assertFalse(checks["created_date_only"].isEnabled())
+
+    def test_possible_matches_are_not_labeled_as_verified_duplicates(self):
+        from duplicate_cleaner.models import SearchCriteria
+        self.window.on_scan(scan([self.root], criteria=SearchCriteria(contents=False, hashes=False)))
+        item = self.window.tree.topLevelItem(0)
+        self.window.tree.setCurrentItem(item)
+        self.assertIn("possible match", self.window.summary.text())
+        self.assertIn("contents not verified", item.text(0))
+        self.assertNotIn("Main file contents match", self.window.comparison_preview.metadata_badge.text())
 
     def test_manual_check_updates_count_and_button(self):
         item = self.window.tree.topLevelItem(0).child(1)
@@ -952,9 +1023,10 @@ class GuiTests(FileTestCase):
         duplicate_groups = list(self.window.groups)
         self.window.on_empty_folder_scan(scan_empty_folders([self.root]))
 
-        self.assertEqual(self.window.workflow_tabs.count(), 2)
-        self.assertEqual(self.window.workflow_tabs.tabText(0), "Duplicate files")
-        self.assertEqual(self.window.workflow_tabs.tabText(1), "Empty folders")
+        self.assertEqual(self.window.workflow_tabs.count(), 5)
+        self.assertEqual(self.window.workflow_tabs.tabText(3), "Similar files")
+        self.assertEqual(self.window.workflow_tabs.tabText(2), "Duplicate files")
+        self.assertEqual(self.window.workflow_tabs.tabText(4), "Empty folders")
         items = list(self.window.empty_folder_items())
         self.assertEqual({item.text(1) for item in items}, {str(first), str(second)})
         self.assertTrue(all(item.checkState(0) == Qt.CheckState.Unchecked for item in items))
@@ -1058,13 +1130,16 @@ class GuiTests(FileTestCase):
             QTest.qWait(20)
             self.assertEqual(self.window.size().width(), 940)
             self.assertEqual(self.window.size().height(), 720)
+            self.window.workflow_tabs.setCurrentWidget(self.window.location_page)
+            self.app.processEvents()
             self.assertLess(self.window.folders.geometry().bottom(), self.window.add_button.y())
             self.assertLess(self.window.excluded_folders.geometry().bottom(), self.window.exclude_button.y())
-            self.assertLess(self.window.load_session_button.geometry().bottom(), self.window.sidebar.height())
+            self.assertTrue(self.window.rect().contains(self.window.load_session_button.geometry()))
+            self.window.workflow_tabs.setCurrentWidget(self.window.duplicate_page)
             self.assertTrue(self.window.type_tabs.tabRect(self.window.type_tabs.count() - 1).right()
                             < self.window.type_tabs.width())
             self.assertTrue(self.window.grab().save(str(self.root.parent / f"gui-tabs-dark-{dark}.png")))
-        self.window.workflow_tabs.setCurrentIndex(1)
+        self.window.workflow_tabs.setCurrentWidget(self.window.empty_page)
         (self.root / "Empty example folder").mkdir()
         self.window.on_empty_folder_scan(scan_empty_folders([self.root]))
         QTest.qWait(20)

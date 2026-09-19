@@ -11,9 +11,9 @@ from PySide6.QtGui import QBrush, QCloseEvent, QColor, QDesktopServices, QFont, 
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-    QFileDialog, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
+    QFileDialog, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
     QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
-    QSplitter, QStyle, QStyledItemDelegate, QStyleOptionViewItem, QTabBar, QTabWidget, QTreeWidget, QTreeWidgetItem,
+    QSpinBox, QSplitter, QStyle, QStyledItemDelegate, QStyleOptionViewItem, QTabBar, QTabWidget, QTreeWidget, QTreeWidgetItem,
     QToolButton, QVBoxLayout, QWidget,
 )
 
@@ -21,9 +21,10 @@ from .cleanup import recycle_selected
 from .empty_folders import (EmptyFolderRecord, EmptyFolderRecycleResult, EmptyFolderScanResult,
                             ensure_empty_folder_current, recycle_empty_folders, scan_empty_folders)
 from .files import ensure_current
-from .models import DuplicateGroup, FileRecord, Progress, RecycleResult, ScanResult, format_bytes
+from .models import DuplicateGroup, FileRecord, Progress, RecycleResult, ScanResult, SearchCriteria, format_bytes
 from .preview import ComparisonPreview
 from .scanner import scan
+from .similar_tab import SimilarTab
 from .sessions import (LoadResult, SaveResult, SessionData, load_session as load_session_file,
                        save_session as save_session_file)
 from .thumbnails import ThumbnailController
@@ -76,10 +77,7 @@ def parse_filter_terms(value: str, *, path: bool = False) -> tuple[tuple[str, bo
 STYLE = """
 QMainWindow, QDialog { background: #f4f6f9; }
 QWidget { color: #25334a; font-family: 'Segoe UI'; font-size: 10pt; }
-QFrame#sidebar { background: #17253b; border-radius: 12px; }
-QFrame#sidebar QLabel, QFrame#sidebar QCheckBox { color: #e2e9f4; }
-QLabel#title { font-size: 24pt; font-weight: 700; color: #162940; }
-QLabel#subtitle, QLabel#hint { color: #64748b; }
+QLabel#hint { color: #64748b; }
 QLabel#filterError { color: #b91c1c; }
 QLineEdit, QComboBox { background: white; border: 1px solid #ccd5e2; border-radius: 5px; padding: 5px; }
 QLabel#section { font-size: 12pt; font-weight: 600; }
@@ -89,15 +87,14 @@ QLabel#summary { background: white; border: 1px solid #e0e6ef; border-radius: 10
                   padding: 16px; font-size: 12pt; font-weight: 600; }
 QPushButton { background: white; border: 1px solid #ccd5e2; border-radius: 7px;
               padding: 9px 14px; font-weight: 600; }
-QFrame#sidebar QPushButton { padding: 6px 10px; }
 QPushButton:hover { background: #eaf0f8; border-color: #8aa7cc; }
 QPushButton:pressed { background: #dce7f6; }
-QToolButton#sidebarToggle, QToolButton#themeToggle, QToolButton#filterToggle {
+QToolButton#themeToggle, QToolButton#filterToggle {
     background: transparent; border: none; border-radius: 6px;
 }
-QToolButton#sidebarToggle:hover, QToolButton#themeToggle:hover,
+QToolButton#themeToggle:hover,
 QToolButton#filterToggle:hover, QToolButton#filterToggle:checked { background: #e0ebff; }
-QToolButton#sidebarToggle:focus, QToolButton#themeToggle:focus,
+QToolButton#themeToggle:focus,
 QToolButton#filterToggle:focus { border: 1px solid #60a5fa; }
 QPushButton#primary { background: #2563eb; border-color: #2563eb; color: white; }
 QPushButton#primary:hover { background: #1d4ed8; }
@@ -125,9 +122,7 @@ QToolTip { background: white; color: #25334a; border: 1px solid #b9c8dc; padding
 DARK_STYLE = """
 QMainWindow, QDialog { background: #111827; }
 QWidget { color: #e2e8f0; }
-QFrame#sidebar { background: #0b1220; }
-QLabel#title { color: #f1f5f9; }
-QLabel#subtitle, QLabel#hint { color: #a5b4c8; }
+QLabel#hint { color: #a5b4c8; }
 QLabel#filterError { color: #fca5a5; }
 QLabel#metadataBadge { background: #16372a; color: #86efac; }
 QLabel#metadataBadge[warning="true"] { background: #3b3520; color: #fde68a; }
@@ -136,7 +131,7 @@ QLabel#summary { background: #1e293b; border-color: #334155; }
 QPushButton { background: #243247; border-color: #475569; }
 QPushButton:hover { background: #334155; border-color: #94a3b8; }
 QPushButton:pressed { background: #3c4e68; }
-QToolButton#sidebarToggle:hover, QToolButton#themeToggle:hover,
+QToolButton#themeToggle:hover,
 QToolButton#filterToggle:hover, QToolButton#filterToggle:checked { background: #334155; }
 QPushButton:disabled, QPushButton#primary:disabled {
     background: #1a2536; border-color: #334155; color: #7f8da3;
@@ -202,8 +197,6 @@ def control_icon(kind: str, dark: bool, color: str | None = None) -> QIcon:
         "search": '<circle cx="10.5" cy="10.5" r="6.5"/><path d="m15.5 15.5 5 5"/>',
         "checked": '<circle cx="12" cy="12" r="9"/><path d="m7.5 12 3 3 6-6"/>',
         "all_checked": '<path d="m12 3 10 18H2Z M12 9v5 M12 17v.5"/>',
-        "sidebar": '<rect x="3" y="4" width="18" height="16" rx="3"/>'
-                   '<path d="M9 4v16M6 8v8"/>',
     }
     svg = (f'<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" '
            f'fill="none" stroke="{color}" stroke-width="1.7" stroke-linecap="round" '
@@ -307,18 +300,12 @@ class MainWindow(QMainWindow):
         container = QWidget()
         self.setCentralWidget(container)
         layout = QVBoxLayout(container)
-        layout.setContentsMargins(24, 22, 24, 20)
-        layout.setSpacing(16)
-        heading = QHBoxLayout()
-        titles = QVBoxLayout()
-        title = QLabel("Duplicate Cleaner")
-        title.setObjectName("title")
-        titles.addWidget(title)
-        subtitle = QLabel("Find identical files. Choose the copies you want to recycle.")
-        subtitle.setObjectName("subtitle")
-        titles.addWidget(subtitle)
-        heading.addLayout(titles)
-        heading.addStretch()
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(12)
+        corner_controls = QWidget()
+        corner_layout = QHBoxLayout(corner_controls)
+        corner_layout.setContentsMargins(0, 0, 0, 0)
+        corner_layout.setSpacing(4)
         self.filter_toggle = QToolButton()
         self.filter_toggle.setObjectName("filterToggle")
         self.filter_toggle.setFixedSize(36, 36)
@@ -327,7 +314,7 @@ class MainWindow(QMainWindow):
         self.filter_toggle.setToolTip("Show filters")
         self.filter_toggle.setAccessibleName("Show filters")
         self.filter_toggle.toggled.connect(self.toggle_filters)
-        heading.addWidget(self.filter_toggle, 0, Qt.AlignmentFlag.AlignVCenter)
+        corner_layout.addWidget(self.filter_toggle)
         self.dark_mode = QToolButton()
         self.dark_mode.setObjectName("themeToggle")
         self.dark_mode.setFixedSize(36, 36)
@@ -335,23 +322,10 @@ class MainWindow(QMainWindow):
         self.dark_mode.setCheckable(True)
         self.dark_mode.setChecked(dark)
         self.dark_mode.toggled.connect(self.change_theme)
-        heading.addWidget(self.dark_mode, 0, Qt.AlignmentFlag.AlignVCenter)
-        layout.addLayout(heading)
+        corner_layout.addWidget(self.dark_mode)
 
-        splitter = QSplitter()
-        self.main_splitter = splitter
-        splitter.setChildrenCollapsible(False)
-        splitter.setHandleWidth(18)
-        layout.addWidget(splitter, 1)
-        self.sidebar_container = QWidget()
-        sidebar_row = QHBoxLayout(self.sidebar_container)
-        sidebar_row.setContentsMargins(0, 0, 0, 0)
-        sidebar_row.setSpacing(4)
-        sidebar = QFrame()
-        self.sidebar = sidebar
-        sidebar.setObjectName("sidebar")
-        sidebar.setMinimumWidth(230)
-        side = QVBoxLayout(sidebar)
+        self.location_page = QWidget()
+        side = QVBoxLayout(self.location_page)
         side.setContentsMargins(18, 16, 18, 16)
         side.setSpacing(6)
         section = QLabel("Choose folders")
@@ -363,11 +337,15 @@ class MainWindow(QMainWindow):
         self.folders.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         side.addWidget(self.folders, 1)
         self.add_button = QPushButton("+ Add folder")
-        self.remove_button = QPushButton("Remove selected folders")
+        self.remove_button = QPushButton("Remove")
+        self.remove_button.setAccessibleName("Remove selected folders")
+        self.remove_button.setToolTip("Remove selected folders from the scan list")
         self.add_button.clicked.connect(self.add_folder)
         self.remove_button.clicked.connect(self.remove_folders)
-        side.addWidget(self.add_button)
-        side.addWidget(self.remove_button)
+        folder_actions = QHBoxLayout()
+        folder_actions.addWidget(self.add_button, 1)
+        folder_actions.addWidget(self.remove_button, 1)
+        side.addLayout(folder_actions)
         excluded_label = QLabel("Excluded subfolders")
         excluded_label.setObjectName("section")
         side.addWidget(excluded_label)
@@ -397,35 +375,18 @@ class MainWindow(QMainWindow):
         self.scan_button.setToolTip("Scanning never changes files. Links and unsafe files are skipped.")
         self.scan_button.setObjectName("primary")
         self.scan_button.clicked.connect(self.start_scan)
-        side.addWidget(self.scan_button)
         self.save_session_button = QPushButton("Save session…")
         self.save_session_button.setToolTip("Save these results and checked files so you can continue later.")
         self.save_session_button.clicked.connect(self.save_session)
-        side.addWidget(self.save_session_button)
         self.load_session_button = QPushButton("Load session…")
         self.load_session_button.setToolTip("Load saved results without scanning file contents again.")
         self.load_session_button.clicked.connect(self.load_session)
-        side.addWidget(self.load_session_button)
-        sidebar_row.addWidget(sidebar)
-        self.sidebar_toggle = QToolButton()
-        self.sidebar_toggle.setObjectName("sidebarToggle")
-        self.sidebar_toggle.setFixedSize(28, 32)
-        self.sidebar_toggle.setIconSize(QSize(20, 20))
-        self.sidebar_toggle.setToolTip("Hide sidebar")
-        self.sidebar_toggle.setAccessibleName("Hide sidebar")
-        self.sidebar_toggle.setCheckable(True)
-        self.sidebar_toggle.setChecked(True)
-        self.sidebar_toggle.toggled.connect(self.toggle_sidebar)
         self.update_control_icons()
-        sidebar_row.addWidget(self.sidebar_toggle, 0, Qt.AlignmentFlag.AlignTop)
-        splitter.addWidget(self.sidebar_container)
 
-        main = QWidget()
-        main_content = QVBoxLayout(main)
-        main_content.setContentsMargins(0, 0, 0, 0)
         self.workflow_tabs = QTabWidget()
         self.workflow_tabs.setAccessibleName("Cleaner tools")
-        main_content.addWidget(self.workflow_tabs)
+        self.workflow_tabs.setCornerWidget(corner_controls, Qt.Corner.TopRightCorner)
+        layout.addWidget(self.workflow_tabs, 1)
         duplicate_page = QWidget()
         content = QVBoxLayout(duplicate_page)
         content.setContentsMargins(12, 12, 12, 12)
@@ -439,7 +400,90 @@ class MainWindow(QMainWindow):
         duplicate_layout.setContentsMargins(0, 0, 0, 0)
         duplicate_layout.setSpacing(0)
         duplicate_layout.addWidget(duplicate_scroll, 1)
-        self.workflow_tabs.addTab(duplicate_container, "Duplicate files")
+        self.duplicate_page = duplicate_container
+        self.criteria_page = QWidget()
+        criteria_layout = QVBoxLayout(self.criteria_page)
+        criteria_layout.setContentsMargins(12, 12, 12, 12)
+        criteria_help = QLabel("All checked criteria must match. Changes apply to the next scan.")
+        criteria_help.setWordWrap(True)
+        criteria_layout.addWidget(criteria_help)
+        self.criteria_checks = {}
+        defaults = SearchCriteria()
+
+        def check(key, label, tip):
+            widget = QCheckBox(label)
+            widget.setToolTip(tip)
+            widget.setChecked(getattr(defaults, key))
+            self.criteria_checks[key] = widget
+            return widget
+
+        def row(parent, *widgets):
+            line = QHBoxLayout()
+            for widget in widgets:
+                line.addWidget(widget)
+            line.addStretch()
+            parent.addLayout(line)
+
+        content_box = QGroupBox("File contents")
+        content_options = QVBoxLayout(content_box)
+        row(content_options,
+            check("hashes", "Same file hash (SHA-256)", "Compare full main-file SHA-256 hashes. Hash matching requires equal size."),
+            check("contents", "Byte-for-byte comparison", "Read and compare every main-file byte. Requires equal size, even with a size tolerance."),
+            check("streams", "Same NTFS extra data", "Require matching extra stream names, sizes, and SHA-256 hashes."))
+        criteria_layout.addWidget(content_box)
+        options_box = QGroupBox("More duplicate options")
+        options = QVBoxLayout(options_box)
+        row(options,
+            check("filename", "Same file name", "Compare the complete filename including its extension."),
+            check("extension", "Same file extension", "Compare the final file extension."),
+            check("similar_names", "Similar file names", "Allow up to the chosen number of character insertions, deletions, or substitutions in the complete filename."))
+        row(options, check("ignore_copy", 'Ignore "Copy" part of filename',
+                           'Ignore common prefixes such as "Copy of " and suffixes such as " - Copy (2)"; keep words such as "copyright" intact.'))
+        self.size_tolerance = QSpinBox()
+        self.size_tolerance.setRange(0, 2_147_483_647)
+        self.size_tolerance.setAccessibleName("File size tolerance in bytes")
+        self.size_tolerance.setToolTip("Maximum size difference between any two files in a group. Hash and byte comparisons still require equal size.")
+        row(options, check("size", "Same file size", "Compare main-file bytes, excluding NTFS extra streams."),
+            self.size_tolerance, QLabel("Bytes tolerance"))
+        row(options, check("created", "Same created date/time", "Compare filesystem creation timestamps."),
+            check("created_date_only", "Match date only", "Compare the creation calendar date in your local timezone, ignoring time."))
+        row(options, check("modified", "Same modified date/time", "Compare exact modification timestamps."),
+            check("modified_date_only", "Match date only", "Compare the modification calendar date in your local timezone, ignoring time."))
+        row(options, check("same_drive", "Same drive", "Require the same filesystem volume."))
+        self.folder_depth = QSpinBox()
+        self.folder_depth.setRange(1, 1000)
+        self.folder_depth.setAccessibleName("Folder match depth")
+        row(options, check("folder", "Same folder name", "Match the immediate parent folder name unless a folder modifier is selected."),
+            check("full_folder", "Match full folder name", "Compare the complete parent folder path."))
+        row(options, check("folder_depth_enabled", "Match depth from top", "Compare the first N folder components below the drive/share, or below the search root when selected. Overrides full-folder matching."),
+            self.folder_depth,
+            check("from_search_root", "Match from search root", "Compare relative folder paths below each scan root. For overlapping roots, use the most specific root."))
+        row(options, check("ignore_same_folder", "Ignore duplicate groups within the same folder", "Hide groups where all files have the same parent folder. Groups spanning folders retain all copies."))
+        criteria_layout.addWidget(options_box)
+        text_box = QGroupBox("Text matching options")
+        text_options = QVBoxLayout(text_box)
+        self.text_tolerance = QSpinBox()
+        self.text_tolerance.setRange(0, 255)
+        self.text_tolerance.setValue(3)
+        self.text_tolerance.setAccessibleName("Similar filename text tolerance")
+        row(text_options, check("case_sensitive", "Is case sensitive", "Apply case-sensitive comparisons to filename, extension, folder names, and Copy markers."),
+            self.text_tolerance, QLabel("Similar text — tolerance"))
+        criteria_layout.addWidget(text_box)
+        self.criteria_hint = QLabel()
+        self.criteria_hint.setWordWrap(True)
+        self.criteria_hint.setObjectName("hint")
+        criteria_layout.addWidget(self.criteria_hint)
+        criteria_layout.addStretch()
+        self.criteria_scroll = QScrollArea()
+        self.criteria_scroll.setWidgetResizable(True)
+        self.criteria_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.criteria_scroll.setWidget(self.criteria_page)
+        for widget in self.criteria_checks.values():
+            widget.toggled.connect(self.update_actions)
+        self.criteria_checks["created_date_only"].setAccessibleName("Match created date only")
+        self.criteria_checks["modified_date_only"].setAccessibleName("Match modified date only")
+        for widget in (self.size_tolerance, self.folder_depth, self.text_tolerance):
+            widget.valueChanged.connect(self.update_actions)
         self.summary = QLabel("Ready to scan")
         self.summary.setObjectName("summary")
         self.summary.setWordWrap(True)
@@ -605,29 +649,23 @@ class MainWindow(QMainWindow):
         foot.addWidget(self.clear_button)
         self.select_folder_button = QPushButton("Select this folder's duplicates")
         self.select_folder_button.setToolTip(
-            "Check every verified duplicate in the highlighted file's exact folder, including files in other tabs.")
+            "Check every listed match in the highlighted file's exact folder, including files in other tabs.")
         self.select_folder_button.clicked.connect(lambda: self.select_folder_duplicates())
         foot.addWidget(self.select_folder_button)
         self.issue_button = QPushButton("Skipped files / errors (0)")
         self.issue_button.clicked.connect(self.show_issues)
         foot.addWidget(self.issue_button)
         foot.addStretch()
+        self.recycle_button = QPushButton("Recycle selected files")
+        self.recycle_button.setObjectName("primary")
+        self.recycle_button.clicked.connect(self.confirm_recycle)
+        foot.addWidget(self.recycle_button)
         content.addLayout(foot)
 
         self.selection_label = QLabel("0 files selected for recycling")
         self.selection_label.setObjectName("section")
         self.selection_label.setWordWrap(True)
         content.addWidget(self.selection_label)
-        action_row = QHBoxLayout()
-        recycle_hint = QLabel("You may select every copy in a group.\nDisk space is freed when you empty the Recycle Bin yourself.")
-        recycle_hint.setObjectName("hint")
-        recycle_hint.setWordWrap(True)
-        action_row.addWidget(recycle_hint, 1)
-        self.recycle_button = QPushButton("Recycle selected files")
-        self.recycle_button.setObjectName("primary")
-        self.recycle_button.clicked.connect(self.confirm_recycle)
-        action_row.addWidget(self.recycle_button)
-        content.addLayout(action_row)
 
         empty_page = QWidget()
         empty_content = QVBoxLayout(empty_page)
@@ -695,10 +733,20 @@ class MainWindow(QMainWindow):
         self.recycle_empty_folders_button.clicked.connect(self.confirm_empty_folder_recycle)
         empty_action.addWidget(self.recycle_empty_folders_button)
         empty_content.addLayout(empty_action)
-        self.workflow_tabs.addTab(empty_page, "Empty folders")
-        splitter.addWidget(main)
-        splitter.setSizes([265, 900])
-        splitter.setStretchFactor(1, 1)
+        self.empty_page = empty_page
+        self.similar_tab = SimilarTab()
+        self.workflow_tabs.addTab(self.location_page, "Scan location")
+        self.workflow_tabs.addTab(self.criteria_scroll, "Search criteria")
+        self.workflow_tabs.addTab(self.duplicate_page, "Duplicate files")
+        self.workflow_tabs.addTab(self.similar_tab, "Similar files")
+        self.workflow_tabs.addTab(self.empty_page, "Empty folders")
+
+        scan_actions = QHBoxLayout()
+        scan_actions.addWidget(self.scan_button)
+        scan_actions.addStretch()
+        scan_actions.addWidget(self.save_session_button)
+        scan_actions.addWidget(self.load_session_button)
+        layout.addLayout(scan_actions)
 
         status_row = QHBoxLayout()
         self.status = QLabel("Add folders to begin.")
@@ -719,21 +767,23 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.progress_bar)
         self.type_tabs.currentChanged.connect(self.filter_results)
         self.workflow_tabs.currentChanged.connect(self.update_details)
+        self.workflow_tabs.currentChanged.connect(self.update_similarity_controls)
         self.update_actions()
 
-    def toggle_sidebar(self, visible):
-        if not visible:
-            self._sidebar_sizes = self.main_splitter.sizes()
-        self.sidebar.setVisible(visible)
-        self.sidebar_container.setMaximumWidth(16777215 if visible else self.sidebar_toggle.width())
-        label = "Hide sidebar" if visible else "Show sidebar"
-        self.sidebar_toggle.setToolTip(label)
-        self.sidebar_toggle.setAccessibleName(label)
-        if visible:
-            self.main_splitter.setSizes(self._sidebar_sizes)
+    def update_similarity_controls(self):
+        separate = self.workflow_tabs.currentWidget() is self.similar_tab
+        for widget in (self.scan_button, self.save_session_button, self.load_session_button,
+                       self.status, self.cancel_button, self.current_path, self.progress_bar, self.filter_toggle):
+            widget.setVisible(not separate)
+        if not separate:
+            self.similar_tab.clear_preview()
         else:
-            width = self.sidebar_toggle.width()
-            self.main_splitter.setSizes([width, sum(self._sidebar_sizes) - width])
+            self.similar_tab.review_selection()
+
+    def search_criteria(self):
+        return SearchCriteria(**{key: check.isChecked() for key, check in self.criteria_checks.items()},
+                              size_tolerance=self.size_tolerance.value(), folder_depth=self.folder_depth.value(),
+                              text_tolerance=self.text_tolerance.value())
 
     def change_theme(self, dark):
         apply_theme(dark)
@@ -747,7 +797,6 @@ class MainWindow(QMainWindow):
         label = "Switch to light mode" if dark else "Switch to dark mode"
         self.dark_mode.setToolTip(label)
         self.dark_mode.setAccessibleName(label)
-        self.sidebar_toggle.setIcon(control_icon("sidebar", dark))
         self.filter_toggle.setIcon(control_icon("search", dark))
 
     def toggle_filters(self, visible):
@@ -756,7 +805,7 @@ class MainWindow(QMainWindow):
         self.filter_toggle.setToolTip(label)
         self.filter_toggle.setAccessibleName(label)
         if visible:
-            self.workflow_tabs.setCurrentIndex(0)
+            self.workflow_tabs.setCurrentWidget(self.duplicate_page)
             self.filename_filter.setFocus()
 
     def add_folder(self):
@@ -815,13 +864,29 @@ class MainWindow(QMainWindow):
 
     def update_actions(self):
         busy = self.worker is not None
+        criteria = self.search_criteria()
+        self.criteria_page.setEnabled(not busy)
+        for key, enabled in (
+                ("ignore_copy", criteria.filename or criteria.similar_names),
+                ("created_date_only", criteria.created), ("modified_date_only", criteria.modified),
+                ("full_folder", criteria.folder and not criteria.folder_depth_enabled),
+                ("folder_depth_enabled", criteria.folder), ("from_search_root", criteria.folder)):
+            self.criteria_checks[key].setEnabled(enabled)
+        self.size_tolerance.setEnabled(criteria.size and not (criteria.hashes or criteria.contents))
+        self.folder_depth.setEnabled(criteria.folder and criteria.folder_depth_enabled)
+        self.text_tolerance.setEnabled(criteria.similar_names)
+        self.criteria_hint.setText(
+            "Choose at least one criterion to enable scanning." if not criteria.enabled else
+            "Contents are verified byte for byte before files appear as duplicates." if criteria.contents else
+            "Hashes match, but bytes are not compared during scanning. Recycling still verifies contents." if criteria.hashes else
+            "Results are possible matches only. Contents must still match before recycling.")
         for widget in (self.add_button, self.remove_button, self.recursive, self.folders,
                        self.excluded_folders, self.tree, self.type_tabs, self.filter_panel,
                        self.comparison_preview, self.empty_folder_tree):
             widget.setEnabled(not busy)
         self.exclude_button.setEnabled(not busy and self.folders.count() > 0)
         self.remove_exclusion_button.setEnabled(not busy and bool(self.excluded_folders.selectedItems()))
-        self.scan_button.setEnabled(not busy and self.folders.count() > 0)
+        self.scan_button.setEnabled(not busy and self.folders.count() > 0 and criteria.enabled)
         self.empty_scan_button.setEnabled(not busy and self.folders.count() > 0)
         self.save_session_button.setEnabled(not busy and self.session_available)
         self.load_session_button.setEnabled(not busy)
@@ -919,6 +984,7 @@ class MainWindow(QMainWindow):
         self.visible_paths.clear()
         visible_groups = 0
         visible_savings = 0
+        possible = False
         self.tree.setUpdatesEnabled(False)
         sorting = self.tree.isSortingEnabled()
         labels = []
@@ -944,6 +1010,7 @@ class MainWindow(QMainWindow):
                 if visible:
                     visible_groups += 1
                     visible_savings += group.extra_bytes
+                    possible = possible or not group.contents_verified
                 label = ("" if visible == parent.childCount() else
                          f"{visible} of {parent.childCount()} files shown")
                 if parent.text(1) != label:
@@ -966,17 +1033,16 @@ class MainWindow(QMainWindow):
             self.summary.setText(self.summary_notice)
         else:
             noun = "group" if visible_groups == 1 else "groups"
-            heading = f"{visible_groups:,} duplicate {noun}"
+            kind = "possible match" if possible else "duplicate"
+            heading = f"{visible_groups:,} {kind} {noun}"
             if self.summary_context == "loaded":
                 heading = "Loaded " + heading
             elif self.summary_context == "remaining":
                 heading += " remaining"
-            self.summary.setText(f"{heading}  ·  {format_bytes(visible_savings)} potentially recoverable")
+            saving_label = "estimated savings · contents not verified" if possible else "potentially recoverable"
+            self.summary.setText(f"{heading}  ·  {format_bytes(visible_savings)} {saving_label}")
         if self.result_filters:
-            self.filter_hint.setText(
-                f"{visible_groups:,} of {len(self.groups):,} duplicate groups shown · filters applied. "
-                "Each matching group contains a file meeting all criteria. "
-                "Other copies remain available; file-type tabs still apply.")
+            self.filter_hint.clear()
         elif selected_view and self.selected:
             noun = "group" if visible_groups == 1 else "groups"
             checked = "file" if len(self.selected) == 1 else "files"
@@ -990,7 +1056,7 @@ class MainWindow(QMainWindow):
                                      "Group totals and savings include copies in other tabs.")
         else:
             self.filter_hint.setText(f"No duplicate files in {category}. Choose All to see other file types.")
-        self.filter_hint.setVisible(bool(self.result_filters) or (category != "All" and bool(self.groups)))
+        self.filter_hint.setVisible(not self.result_filters and category != "All" and bool(self.groups))
         self.update_group_highlights()
         self.update_actions()
         self.update_details()
@@ -1022,7 +1088,7 @@ class MainWindow(QMainWindow):
             if all_checked:
                 description += ". All copies selected; no listed copy will remain."
             parent.setData(0, Qt.ItemDataRole.AccessibleDescriptionRole, description)
-            parent.setToolTip(0, f"{group.metadata_status}\nScan SHA-256: {group.digest}"
+            parent.setToolTip(0, f"{group.metadata_status}\nScan SHA-256: {group.digest or 'Not calculated'}"
                              + (f"\n{description}" if checked else ""))
 
     def start_job(self, job, handler, error_handler=None):
@@ -1037,9 +1103,10 @@ class MainWindow(QMainWindow):
         self.worker.start()
 
     def start_scan(self):
-        if self.worker is not None or not self.folders.count():
+        criteria = self.search_criteria()
+        if self.worker is not None or not self.folders.count() or not criteria.enabled:
             return
-        self.workflow_tabs.setCurrentIndex(0)
+        self.workflow_tabs.setCurrentWidget(self.duplicate_page)
         roots = [self.folders.item(i).text() for i in range(self.folders.count())]
         recursive = self.recursive.isChecked()
         exclusions = self.excluded_folder_paths()
@@ -1050,14 +1117,18 @@ class MainWindow(QMainWindow):
         self.summary_notice = "Scanning your folders…"
         self.set_groups([])
         self.issues = []
-        self.empty.setText("Checking size → samples → SHA-256 → every byte. No files will be changed.")
-        self.start_job(lambda **kwargs: scan(roots, recursive, excluded_folders=exclusions, **kwargs),
+        self.empty.setText("Checking size → samples → SHA-256 → every byte. No files will be changed."
+                           if criteria.contents and criteria.hashes else
+                           "Comparing files byte for byte." if criteria.contents else
+                           "Comparing SHA-256 hashes. Bytes will be verified before recycling." if criteria.hashes else
+                           "Matching the selected criteria. File contents are not verified.")
+        self.start_job(lambda **kwargs: scan(roots, recursive, excluded_folders=exclusions, criteria=criteria, **kwargs),
                        self.on_scan)
 
     def start_empty_folder_scan(self):
         if self.worker is not None or not self.folders.count():
             return
-        self.workflow_tabs.setCurrentIndex(1)
+        self.workflow_tabs.setCurrentWidget(self.empty_page)
         roots = [self.folders.item(index).text() for index in range(self.folders.count())]
         recursive = self.recursive.isChecked()
         exclusions = self.excluded_folder_paths()
@@ -1162,7 +1233,7 @@ class MainWindow(QMainWindow):
             return
         restore_checks = restore is not None and clicked == restore
 
-        self.workflow_tabs.setCurrentIndex(0)
+        self.workflow_tabs.setCurrentWidget(self.duplicate_page)
         self.issues = list(data.issues) + list(result.validation_issues)
         self.scan_file_count = data.file_count
         self.scan_total_bytes = data.total_bytes
@@ -1226,7 +1297,7 @@ class MainWindow(QMainWindow):
                 ])
                 parent.setData(2, Qt.ItemDataRole.UserRole, group.extra_bytes)
                 parent.setData(0, Qt.ItemDataRole.UserRole, group)
-                parent.setToolTip(0, f"{group.metadata_status}\nScan SHA-256: {group.digest}")
+                parent.setToolTip(0, f"{group.metadata_status}\nScan SHA-256: {group.digest or 'Not calculated'}")
                 font = QFont()
                 font.setBold(True)
                 parent.setFont(0, font)
@@ -1332,7 +1403,7 @@ class MainWindow(QMainWindow):
         self.preview_toggle.setText("Hide preview" if self.preview_toggle.isChecked() else "Show preview")
         item = self.tree.currentItem()
         if (self._changing_checks or item is None or not item.isSelected()
-                or self.workflow_tabs.currentIndex() != 0):
+                or self.workflow_tabs.currentWidget() is not self.duplicate_page):
             self.details_text.clear()
             self.comparison_preview.clear()
             self.details_panel.hide()
@@ -1362,8 +1433,9 @@ class MainWindow(QMainWindow):
             f"Extra NTFS streams: {len(record.streams)} ({record.total_size - record.size:,} bytes)",
             f"Modified at scan: {modified:%Y-%m-%d %H:%M:%S}",
             f"Created: {created.toString('yyyy-MM-dd HH:mm:ss') if created.isValid() else 'Unavailable'}",
-            f"Duplicate group: {len(group.files)} copies with main contents verified byte for byte at scan time",
-            f"SHA-256 at scan: {group.digest}",
+            (f"Duplicate group: {len(group.files)} copies with main contents verified byte for byte at scan time"
+             if group.contents_verified else f"Possible match group: {len(group.files)} files; contents not verified"),
+            f"SHA-256 at scan: {group.digest or 'Not calculated'}",
             f"Selection: {selection}",
             f"Current status: {state}",
         ]
@@ -1420,7 +1492,7 @@ class MainWindow(QMainWindow):
         if result.cancelled:
             self.empty.setText("Start another scan when you are ready. Partial results are not used for cleanup.")
         else:
-            self.empty.setText("No verified duplicates found. Check skipped files / errors for anything we could not inspect.")
+            self.empty.setText("No matching groups found. Check skipped files / errors for anything we could not inspect.")
         self.status.setText(f"{'Cancelled' if result.cancelled else 'Scan complete'}  ·  "
                             f"{result.file_count:,} files discovered  ·  {format_bytes(result.total_bytes)}  ·  "
                             f"{len(result.issues):,} skipped / errors")
@@ -1566,6 +1638,10 @@ class MainWindow(QMainWindow):
         dialog.setIcon(QMessageBox.Icon.Warning)
         dialog.setText(f"Send {len(selected):,} selected files ({format_bytes(amount)}) to the Recycle Bin?")
         information = "Only the files you checked will be recycled. Contents and file safety are rechecked before recycling.\n\nFiles that cannot be safely recycled will be skipped. Nothing is permanently deleted."
+        if any(not group.contents_verified and any(record.path in selected for record in group.files)
+               for group in groups):
+            information += ("\n\nSome selected files are possible matches from a criteria-only scan. "
+                            "They will be recycled only if their contents match the comparison copy.")
         hidden = len(selected - self.visible_paths)
         if hidden:
             information = (f"Includes {hidden:,} selected file(s) hidden by the current tab or filters. "
@@ -1648,7 +1724,7 @@ class MainWindow(QMainWindow):
         for group in self.groups:
             remaining_files = tuple(record for record in group.files if record.path not in recycled)
             if len(remaining_files) > 1:
-                remaining_groups.append(DuplicateGroup(remaining_files, group.digest))
+                remaining_groups.append(DuplicateGroup(remaining_files, group.digest, group.byte_verified))
         self.summary_notice = None
         self.summary_context = "remaining"
         self.set_groups(remaining_groups)
@@ -1734,6 +1810,13 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Could not open folder", str(record.path))
 
     def closeEvent(self, event: QCloseEvent):
+        if self.similar_tab.worker is not None:
+            self.similar_tab.cancel_scan()
+            self.similar_tab.status.setText("Stopping safely. Close the window again once the scan has stopped.")
+            if self.worker is not None:
+                self.cancel_work()
+            event.ignore()
+            return
         if self.worker is not None:
             self.cancel_work()
             event.ignore()
@@ -1741,6 +1824,7 @@ class MainWindow(QMainWindow):
         else:
             self.thumbnails.close()
             self.comparison_preview.close()
+            self.similar_tab.shutdown()
             event.accept()
 
 

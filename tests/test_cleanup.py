@@ -5,11 +5,37 @@ from unittest.mock import Mock, patch
 
 from duplicate_cleaner.cleanup import recycle_selected
 from duplicate_cleaner.files import open_checked
+from duplicate_cleaner.models import SearchCriteria
 from duplicate_cleaner.scanner import compare_streams, scan
 from tests.support import FileTestCase
 
 
 class CleanupTests(FileTestCase):
+    def test_criteria_only_results_still_require_matching_contents_before_recycling(self):
+        first = self.file("a", b"aaa")
+        second = self.file("b", b"bbb")
+        groups = scan([self.root], criteria=SearchCriteria(contents=False, hashes=False)).groups
+        for selected in ((first,), (first, second)):
+            with self.subTest(selected=selected):
+                recycler = Mock()
+                result = recycle_selected(groups, selected, recycler=recycler)
+                recycler.assert_not_called()
+                self.assertFalse(result.recycled)
+                self.assertEqual(len(result.issues), len(selected))
+
+    def test_criteria_only_identical_files_can_be_reverified_for_recycling(self):
+        first = self.file("a", b"same")
+        self.file("b", b"same")
+        groups = scan([self.root], criteria=SearchCriteria(contents=False, hashes=False)).groups
+        calls = []
+        def recycler(path, revalidate):
+            revalidate()
+            calls.append(path)
+        result = recycle_selected(groups, [first], recycler=recycler)
+        self.assertEqual(calls, [first])
+        self.assertEqual(result.recycled, [first])
+        self.assertFalse(result.issues)
+
     def test_reference_close_failure_does_not_duplicate_completed_reports(self):
         paths, groups = self.copies(3)
         reference = groups[0].files[2]

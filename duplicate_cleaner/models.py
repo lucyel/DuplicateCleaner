@@ -3,6 +3,37 @@ from pathlib import Path
 
 
 @dataclass(frozen=True)
+class SearchCriteria:
+    contents: bool = True
+    hashes: bool = True
+    size: bool = True
+    filename: bool = False
+    extension: bool = False
+    modified: bool = False
+    streams: bool = False
+    similar_names: bool = False
+    ignore_copy: bool = False
+    size_tolerance: int = 0
+    created: bool = False
+    created_date_only: bool = False
+    modified_date_only: bool = False
+    same_drive: bool = False
+    folder: bool = False
+    full_folder: bool = False
+    folder_depth_enabled: bool = False
+    folder_depth: int = 1
+    from_search_root: bool = False
+    ignore_same_folder: bool = False
+    case_sensitive: bool = False
+    text_tolerance: int = 3
+
+    @property
+    def enabled(self) -> bool:
+        return any((self.contents, self.hashes, self.size, self.filename, self.extension,
+                    self.modified, self.streams, self.similar_names, self.created, self.same_drive, self.folder))
+
+
+@dataclass(frozen=True)
 class FileRecord:
     path: Path
     size: int
@@ -22,7 +53,14 @@ class FileRecord:
 @dataclass(frozen=True)
 class DuplicateGroup:
     files: tuple[FileRecord, ...]
-    digest: str
+    # None means no main-file hash was calculated (metadata-only or byte-only scanning).
+    digest: str | None
+    # Older groups infer byte verification from their digest. New modes record it explicitly.
+    byte_verified: bool | None = None
+
+    @property
+    def contents_verified(self) -> bool:
+        return self.byte_verified if self.byte_verified is not None else self.digest is not None
 
     @property
     def extra_bytes(self) -> int:
@@ -42,6 +80,10 @@ class DuplicateGroup:
 
     @property
     def metadata_status(self) -> str:
+        if not self.contents_verified:
+            if self.digest is not None:
+                return "Hash match — bytes not verified"
+            return "Possible match — contents not verified"
         if not self.metadata_checked:
             return "Metadata not checked — rescan"
         return "Metadata differs" if self.differing_streams else "Exact match"
@@ -50,7 +92,9 @@ class DuplicateGroup:
     def metadata_details(self) -> str:
         names = sorted({name for record in self.files for name, size in record.streams})
         differences = set(self.differing_streams)
-        lines = [self.metadata_status, "Main file contents match byte for byte."]
+        lines = [self.metadata_status, "Main file contents match byte for byte." if self.contents_verified
+                 else "SHA-256 hashes match. Main file bytes have not been compared." if self.digest is not None
+                 else "Matched search criteria only. Contents must match before recycling."]
         if not names:
             lines.append("No extra NTFS streams.")
             return "\n".join(lines)

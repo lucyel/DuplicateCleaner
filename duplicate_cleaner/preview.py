@@ -356,6 +356,8 @@ class GroupGallery(QListWidget):
         self.setViewMode(QListView.ViewMode.IconMode)
         self.setResizeMode(QListView.ResizeMode.Adjust)
         self.setMovement(QListView.Movement.Static)
+        # Keep the layout width stable when a group gains or loses a scrollable row.
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         self.setIconSize(QSize(190, 140))
         self.setGridSize(QSize(210, 210))
         self.setWordWrap(True)
@@ -364,11 +366,12 @@ class GroupGallery(QListWidget):
         self.selected = set()
         self.visible = set()
         self.requested = set()
+        self.images = {}
         self.file_icon = self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon)
         self.loaders = (PreviewPane("Gallery loader", self), PreviewPane("Gallery loader", self))
         for loader in self.loaders:
             loader.hide()
-            loader.preview_size = 320
+            loader.preview_size = 1280
             loader.ready.connect(lambda record, image, error, source=loader:
                                  self.loaded(source, record, image, error))
         self.refresh_timer = QTimer(self)
@@ -385,6 +388,7 @@ class GroupGallery(QListWidget):
                 self.files = files
                 for record in files:
                     item = QListWidgetItem(self.file_icon, record.path.name, self)
+                    item.setSizeHint(self.gridSize())
                     item.setData(Qt.ItemDataRole.UserRole, record)
                     item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                     item.setToolTip(str(record.path))
@@ -420,11 +424,13 @@ class GroupGallery(QListWidget):
     def refresh_visible(self):
         if not self.isVisible() or not self.files:
             return
+        self.resize_tiles()
         visible = {index for index in range(self.count())
                    if self.visualItemRect(self.item(index)).intersects(self.viewport().rect())}
         for index in self.visible - visible:
             self.item(index).setIcon(self.file_icon)
             self.requested.discard(index)
+            self.images.pop(index, None)
         self.visible = visible
         pending = sorted(visible - self.requested)
         for loader in self.loaders:
@@ -437,12 +443,44 @@ class GroupGallery(QListWidget):
         if pending or any(loader.record is not None or loader.process is not None for loader in self.loaders):
             self.refresh_timer.start(100)
 
+    def resize_tiles(self):
+        area = self.viewport().size()
+        columns = min(self.count(), max(1, area.width() // 280))
+        rows = (self.count() + columns - 1) // columns
+        visible_rows = min(rows, max(1, area.height() // 250))
+        grid = QSize(max(1, (area.width() - 4) // columns),
+                     max(1, (area.height() - 4) // visible_rows))
+        size = QSize(max(1, grid.width() - 28), max(1, grid.height() - 60))
+        if grid == self.gridSize() and size == self.iconSize():
+            return
+        self.setGridSize(grid)
+        self.setIconSize(size)
+        for index in range(self.count()):
+            self.item(index).setSizeHint(grid)
+        for index, image in self.images.items():
+            self.set_thumbnail(index, image)
+        self.doItemsLayout()
+
+    def set_thumbnail(self, index, image):
+        size = self.iconSize()
+        thumbnail = image.scaled(size, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                                 Qt.TransformationMode.SmoothTransformation)
+        # Fill the tile without stretching; retain the source for panel resizing.
+        thumbnail = thumbnail.copy((thumbnail.width() - size.width()) // 2,
+                                   (thumbnail.height() - size.height()) // 2,
+                                   size.width(), size.height())
+        self.item(index).setIcon(QIcon(QPixmap.fromImage(thumbnail)))
+
     def loaded(self, loader, record, image, error):
         if record in self.files:
             index = self.files.index(record)
             if index in self.visible:
                 item = self.item(index)
-                item.setIcon(QIcon(QPixmap.fromImage(image)) if not image.isNull() else self.file_icon)
+                if image.isNull():
+                    item.setIcon(self.file_icon)
+                else:
+                    self.images[index] = image
+                    self.set_thumbnail(index, image)
                 item.setToolTip(str(record.path) + (f"\n{error}" if error else ""))
         loader.set_record(None)
         self.refresh_timer.start(0)
@@ -453,6 +491,7 @@ class GroupGallery(QListWidget):
             loader.set_record(None)
         self.files, self.visible, self.requested = (), set(), set()
         self.selected.clear()
+        self.images.clear()
         super().clear()
 
     def close(self):
@@ -469,6 +508,7 @@ class ComparisonPreview(QWidget):
         super().__init__(parent)
         self.files = ()
         self.anchor = None
+        self.pair_indices = (0, 1)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         self.metadata_badge = QLabel()
@@ -507,7 +547,8 @@ class ComparisonPreview(QWidget):
 
     def set_group(self, group, anchor, selected):
         files = group.files
-        self.metadata_badge.setText(group.metadata_status + " · Main file contents match")
+        self.metadata_badge.setText(group.metadata_status + (
+            " · Main file contents match" if group.contents_verified else ""))
         warning = group.metadata_status != "Exact match"
         if self.metadata_badge.property("warning") != warning:
             self.metadata_badge.setProperty("warning", warning)
@@ -518,7 +559,15 @@ class ComparisonPreview(QWidget):
         self.metadata_toggle.setVisible(has_streams)
         self.metadata_details.setPlainText(group.metadata_details)
         self.metadata_details.setVisible(has_streams and self.metadata_toggle.isChecked())
-        changed = files != self.files or anchor != self.anchor
+        group_changed = files != self.files
+        if group_changed:
+            self.pair_indices = (0, 1)
+        if anchor in files and (group_changed or anchor != self.anchor):
+            index = files.index(anchor)
+            if index not in self.pair_indices:
+                # Keep the comparison copy and follow the group's order, rather
+                # than moving every clicked file into the left-hand pane.
+                self.pair_indices = tuple(sorted((self.pair_indices[0], index)))
         self.files, self.anchor = files, anchor
         if anchor is None:
             for pane in self.panes:
@@ -530,10 +579,8 @@ class ComparisonPreview(QWidget):
         self.stack.setCurrentWidget(self.pair)
         for pane in self.panes:
             pane.selected = selected
-        if changed:
-            left = files.index(anchor) if anchor in files else 0
-            right = next(index for index in range(len(files)) if index != left)
-            for pane, index in zip(self.panes, (left, right)):
+        for pane, index in zip(self.panes, self.pair_indices):
+            if group_changed or pane.record != files[index]:
                 pane.chooser.blockSignals(True)
                 pane.chooser.clear()
                 for record in files:
@@ -542,8 +589,7 @@ class ComparisonPreview(QWidget):
                 pane.chooser.setCurrentIndex(index)
                 pane.chooser.blockSignals(False)
                 pane.set_record(files[index])
-        else:
-            for pane in self.panes:
+            else:
                 pane.update_info()
 
     def choose(self, slot, index):
@@ -557,9 +603,11 @@ class ComparisonPreview(QWidget):
             other.chooser.blockSignals(False)
             other.set_record(self.files[previous])
         pane.set_record(self.files[index])
+        self.pair_indices = tuple(self.files.index(current.record) for current in self.panes)
 
     def clear(self):
         self.files, self.anchor = (), None
+        self.pair_indices = (0, 1)
         self.metadata_badge.hide()
         self.metadata_toggle.hide()
         self.metadata_details.hide()

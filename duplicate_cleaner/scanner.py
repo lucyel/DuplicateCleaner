@@ -8,7 +8,8 @@ from time import monotonic
 from typing import BinaryIO, Callable, Iterable
 
 from .files import capture, check_location, ensure_current, open_checked, open_named_streams, UnsafeFile
-from .models import Cancelled, DuplicateGroup, FileRecord, Issue, Progress, ScanResult
+from .matching import candidate_key, compatible
+from .models import Cancelled, DuplicateGroup, FileRecord, Issue, Progress, ScanResult, SearchCriteria
 
 CHUNK_SIZE = 1024 * 1024
 SAMPLE_SIZE = 64 * 1024
@@ -129,14 +130,21 @@ def differing_named_streams(left: FileRecord, first: dict[str, BinaryIO],
 
 def scan(roots: Iterable[Path | str], recursive: bool = True, *,
          excluded_folders: Iterable[Path | str] = (),
+         criteria: SearchCriteria = SearchCriteria(),
          cancel: Event | None = None,
          progress: Callable[[Progress], None] | None = None) -> ScanResult:
+    if not criteria.enabled:
+        raise ValueError("Choose at least one search criterion")
+    if criteria.size_tolerance < 0 or criteria.text_tolerance < 0 or criteria.folder_depth < 1:
+        raise ValueError("Tolerances must be nonnegative and folder depth must be positive")
     result = ScanResult()
     reporter = Reporter(cancel if cancel is not None else Event(), progress)
-    by_size: dict[int, list[FileRecord]] = defaultdict(list)
+    by_match: dict[tuple, list[FileRecord]] = defaultdict(list)
     seen_dirs: set[tuple[int, int]] = set()
     seen_files: set[tuple[int, int]] = set()
-    stack = [Path(os.path.abspath(root)) for root in roots]
+    scan_roots = sorted({Path(os.path.abspath(root)) for root in roots},
+                        key=lambda path: (-len(path.parts), str(path).casefold()))
+    stack = list(scan_roots)
     exclusions = {Path(os.path.abspath(path)) for path in excluded_folders}
     try:
         reporter.emit(True)
@@ -163,8 +171,8 @@ def scan(roots: Iterable[Path | str], recursive: bool = True, *,
                             continue
                         reporter.path = str(path)
                         try:
-                            attributes = getattr(entry.stat(follow_symlinks=False),
-                                                 "st_file_attributes", 0)
+                            entry_info = entry.stat(follow_symlinks=False)
+                            attributes = getattr(entry_info, "st_file_attributes", 0)
                             if entry.is_symlink() or attributes & 0x400:
                                 raise UnsafeFile("Link, junction, or reparse point skipped")
                             if entry.is_dir(follow_symlinks=False):
@@ -176,7 +184,11 @@ def scan(roots: Iterable[Path | str], recursive: bool = True, *,
                             if identity in seen_files:
                                 continue
                             seen_files.add(identity)
-                            by_size[record.size].append(record)
+                            # Overlapping roots always use the most specific configured root.
+                            root = (next(root for root in scan_roots if record.path.is_relative_to(root))
+                                    if criteria.folder and criteria.from_search_root else folder)
+                            key = candidate_key(record, root, entry_info, criteria)
+                            by_match[key].append(record)
                             result.file_count += 1
                             result.total_bytes += record.total_size
                             reporter.completed = result.file_count
@@ -186,13 +198,14 @@ def scan(roots: Iterable[Path | str], recursive: bool = True, *,
             except OSError as exc:
                 result.issues.append(Issue(folder, str(exc)))
 
-        candidates = [files for files in by_size.values() if len(files) > 1]
+        candidates = [files for files in by_match.values() if len(files) > 1]
         # Discovery-only indexes otherwise retain every unique file until the scan ends.
-        by_size.clear()
+        by_match.clear()
         seen_dirs.clear()
         seen_files.clear()
-        for stage, digest_function in (("Comparing samples", sample_digest),
-                                       ("Hashing full contents", full_digest)):
+        digests = {}
+        stages = (("Comparing samples", sample_digest), ("Hashing full contents", full_digest)) if criteria.hashes else ()
+        for stage, digest_function in stages:
             reporter.stage = stage
             reporter.completed = 0
             reporter.total = sum(len(files) for files in candidates)
@@ -218,18 +231,33 @@ def scan(roots: Iterable[Path | str], recursive: bool = True, *,
                         digests[bucket[0].path] = digest.hex()
             candidates = next_candidates
 
-        reporter.stage = "Verifying every byte"
+        reporter.stage = "Verifying every byte" if criteria.contents else "Matching search criteria"
         reporter.completed = 0
         reporter.total = sum(len(files) for files in candidates)
         reporter.emit(True)
         for files in candidates:
             verified: list[list[FileRecord]] = []
             try:
-                for record in files:
+                for record in sorted(files, key=lambda item: (
+                        item.size if criteria.size and criteria.size_tolerance else 0, str(item.path).casefold())):
                     reporter.path = str(record.path)
                     reporter.check()
+                    if record.streams and not criteria.hashes and (criteria.contents or criteria.streams):
+                        record = replace(record, stream_hashes=hash_named_streams(record, reporter))
                     for bucket in verified:
-                        if identical(bucket[0], record, reporter):
+                        if criteria.streams and (record.streams, record.stream_hashes) != (
+                                bucket[0].streams, bucket[0].stream_hashes):
+                            continue
+                        # Size-tolerant candidates arrive in ascending size order.
+                        matches = not criteria.size or record.size - bucket[0].size <= criteria.size_tolerance
+                        if matches and criteria.similar_names:
+                            # Every pair must meet tolerances; do not chain loose matches.
+                            for previous in bucket:
+                                reporter.check()
+                                if not compatible(previous, record, criteria):
+                                    matches = False
+                                    break
+                        if matches and (not criteria.contents or identical(bucket[0], record, reporter)):
                             bucket.append(record)
                             break
                     else:
@@ -239,10 +267,12 @@ def scan(roots: Iterable[Path | str], recursive: bool = True, *,
                 for record in files:
                     ensure_current(record)
                 for bucket in verified:
-                    if len(bucket) > 1:
+                    if len(bucket) > 1 and (not criteria.ignore_same_folder or
+                                            len({record.path.parent for record in bucket}) > 1):
                         result.groups.append(DuplicateGroup(
                             tuple(sorted(bucket, key=lambda item: str(item.path).casefold())),
-                            digests[files[0].path],
+                            digests[files[0].path] if criteria.hashes else None,
+                            None if criteria.contents and criteria.hashes else criteria.contents,
                         ))
             except OSError as exc:
                 for record in files:

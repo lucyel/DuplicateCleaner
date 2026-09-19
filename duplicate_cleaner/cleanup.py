@@ -61,6 +61,9 @@ def recycle_selected(groups: Iterable[DuplicateGroup], selected: Iterable[Path],
                                     if (reference.size != record.size
                                             or not compare_streams(reference_stream, target_stream, reference.size, reporter)):
                                         label = "comparison copy" if recycle_reference else "remaining copy"
+                                        if not group.contents_verified:
+                                            raise UnsafeFile(f"Contents do not match the {label}; "
+                                                             "recycling requires identical contents")
                                         raise UnsafeFile(f"Contents no longer match the {label}; scan again")
                                     differences = differing_named_streams(
                                         reference, reference_extra, record, target_extra, reporter)

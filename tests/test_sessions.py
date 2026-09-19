@@ -2,7 +2,7 @@ import json
 from dataclasses import asdict, replace
 from threading import Event
 
-from duplicate_cleaner.models import DuplicateGroup, Issue
+from duplicate_cleaner.models import DuplicateGroup, Issue, SearchCriteria
 from duplicate_cleaner.scanner import scan
 from duplicate_cleaner.sessions import (FORMAT_NAME, FORMAT_VERSION, SessionData,
                                         SessionFormatError, load_session, save_session)
@@ -10,6 +10,51 @@ from tests.support import FileTestCase
 
 
 class SessionTests(FileTestCase):
+    def test_hash_only_and_byte_only_verification_survive_round_trip(self):
+        first = self.file("a", b"aaa")
+        self.file("b", b"aaa")
+        for criteria in (SearchCriteria(contents=False), SearchCriteria(hashes=False)):
+            with self.subTest(criteria=criteria):
+                groups = scan([self.root], criteria=criteria).groups
+                path = self.root / "mode.dupsession"
+                save_session(path, self.session_data(groups, [first]))
+                loaded = load_session(path).data.groups[0]
+                self.assertEqual(loaded.digest, groups[0].digest)
+                self.assertEqual(loaded.contents_verified, criteria.contents)
+                self.assertEqual(loaded.metadata_status, groups[0].metadata_status)
+
+    def test_version_one_sessions_still_infer_verification(self):
+        self.file("a")
+        self.file("b")
+        path = self.root / "legacy.dupsession"
+        save_session(path, self.session_data(scan([self.root]).groups))
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["version"] = 1
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        self.assertTrue(load_session(path).data.groups[0].contents_verified)
+
+    def test_nonboolean_verification_flag_is_rejected(self):
+        self.file("a")
+        self.file("b")
+        path = self.root / "invalid.dupsession"
+        save_session(path, self.session_data(scan([self.root]).groups))
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["groups"][0]["byte_verified"] = "false"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        with self.assertRaisesRegex(SessionFormatError, "boolean"):
+            load_session(path)
+
+    def test_possible_matches_remain_unverified_after_session_round_trip(self):
+        first = self.file("a", b"aaa")
+        self.file("b", b"bbb")
+        groups = scan([self.root], criteria=SearchCriteria(contents=False, hashes=False)).groups
+        path = self.root / "possible.dupsession"
+        save_session(path, self.session_data(groups, [first]))
+        loaded = load_session(path).data
+        self.assertEqual(loaded.selected, frozenset([first]))
+        self.assertIsNone(loaded.groups[0].digest)
+        self.assertIn("Possible match", loaded.groups[0].metadata_status)
+
     def test_exclusions_round_trip_and_older_sessions_default_to_none(self):
         path = self.root / "exclusions.dupsession"
         excluded = (str(self.root / "skip"),)
@@ -55,7 +100,7 @@ class SessionTests(FileTestCase):
             fields["streams"] = [list(pair) for pair in record.streams]
             fields["stream_hashes"] = [list(pair) for pair in record.stream_hashes]
             expected_files.append(fields)
-        self.assertEqual(payload["version"], 1)
+        self.assertEqual(payload["version"], FORMAT_VERSION)
         self.assertEqual(payload["groups"], [{"digest": group.digest, "files": expected_files}])
         loaded = load_session(path)
 

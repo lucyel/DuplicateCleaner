@@ -37,6 +37,7 @@ class ResultControlTests(FileTestCase):
         self.file("Empty/zero.a", b"")
         self.file("Empty/zero.b", b"")
         self.window = MainWindow()
+        self.window.workflow_tabs.setCurrentWidget(self.window.duplicate_page)
         self.window.on_scan(scan([self.root]))
         self.addCleanup(self.close_window)
 
@@ -506,6 +507,13 @@ class ResultControlTests(FileTestCase):
             self.app.processEvents()
             self.assertEqual(self.window.width(), 940)
             self.assertEqual(self.window.height(), 720)
+            self.assertTrue(self.window.filter_hint.isHidden())
+            self.window.workflow_tabs.setCurrentWidget(self.window.location_page)
+            self.app.processEvents()
+            self.assertEqual(self.window.add_button.geometry().top(), self.window.remove_button.geometry().top())
+            self.assertLess(self.window.add_button.geometry().right(), self.window.remove_button.geometry().left())
+            self.window.workflow_tabs.setCurrentWidget(self.window.duplicate_page)
+            self.app.processEvents()
             self.assertTrue(self.window.filter_panel.rect().contains(self.window.apply_filter_button.geometry()))
             self.assertTrue(self.window.rect().contains(self.window.clear_filter_button.mapTo(
                 self.window, self.window.clear_filter_button.rect().bottomRight())))

@@ -17,7 +17,7 @@ from PySide6.QtWidgets import QApplication
 
 from duplicate_cleaner.files import capture
 from duplicate_cleaner.gui import MainWindow
-from duplicate_cleaner.preview import render_preview
+from duplicate_cleaner.preview import GroupGallery, render_preview
 from duplicate_cleaner.scanner import scan
 from tests.support import FileTestCase
 
@@ -54,6 +54,7 @@ class PreviewTests(FileTestCase):
         settings.start()
         self.addCleanup(settings.stop)
         self.window = MainWindow()
+        self.window.workflow_tabs.setCurrentWidget(self.window.duplicate_page)
         self.addCleanup(self.window.close)
         self.window.add_folder_path(str(first.parent))
         self.window.on_scan(scan([self.root]))
@@ -83,7 +84,8 @@ class PreviewTests(FileTestCase):
                          set(self.window.groups[0].files))
         item = group.child(2)
         self.window.tree.setCurrentItem(item)
-        self.assertEqual(self.preview.panes[0].record, item.data(0, Qt.ItemDataRole.UserRole))
+        self.assertEqual(self.preview.panes[1].record, item.data(0, Qt.ItemDataRole.UserRole))
+        self.assertEqual(self.preview.panes[0].record, self.preview.files[0])
         self.assertNotEqual(self.preview.panes[0].record, self.preview.panes[1].record)
         self.assertFalse(self.window.selected)
 
@@ -96,7 +98,7 @@ class PreviewTests(FileTestCase):
         self.window.tree.setFocus()
         QTest.keyClick(self.window.tree, Qt.Key.Key_Down)
         self.assertEqual(self.window.tree.currentItem(), item.child(0))
-        self.assertEqual(self.preview.panes[0].record, item.child(0).data(0, Qt.ItemDataRole.UserRole))
+        self.assertEqual(tuple(pane.record for pane in self.preview.panes), group.files[:2])
         self.assertNotEqual(self.preview.panes[0].record, self.preview.panes[1].record)
         self.assertFalse(self.window.selected)
 
@@ -122,8 +124,43 @@ class PreviewTests(FileTestCase):
         group = self.window.tree.topLevelItem(0)
         item = next(group.child(i) for i in range(group.childCount()) if not group.child(i).isHidden())
         self.window.tree.setCurrentItem(item)
-        self.assertEqual(self.preview.panes[1].record.path.suffix, ".bin")
-        self.assertIn("Archive", self.preview.panes[1].path.toolTip())
+        self.assertEqual(self.preview.panes[0].record.path.suffix, ".bin")
+        self.assertIn("Archive", self.preview.panes[0].path.toolTip())
+
+    def test_clicking_either_file_or_group_keeps_pair_order(self):
+        group = self.window.groups[0]
+        self.window.set_groups([replace(group, files=group.files[:2])])
+        parent = self.window.tree.topLevelItem(0)
+        for index in (1, 0, None, 0, 1, None, 1):
+            self.window.tree.setCurrentItem(parent if index is None else parent.child(index))
+            if index is None:
+                gallery_files = tuple(self.preview.gallery.item(i).data(Qt.ItemDataRole.UserRole) for i in range(2))
+                self.assertEqual(gallery_files, group.files[:2])
+            else:
+                self.assertEqual(tuple(pane.record for pane in self.preview.panes), group.files[:2])
+
+    def test_third_file_keeps_group_order_and_visible_pair_does_not_reset(self):
+        parent = self.select_file(group_row=True)
+        files = self.preview.files
+        third = next(parent.child(i) for i in range(parent.childCount())
+                     if parent.child(i).data(0, Qt.ItemDataRole.UserRole) == files[2])
+        first = next(parent.child(i) for i in range(parent.childCount())
+                     if parent.child(i).data(0, Qt.ItemDataRole.UserRole) == files[0])
+        for item in (third, first, parent, third, first):
+            self.window.tree.setCurrentItem(item)
+            if item is not parent:
+                self.assertEqual(tuple(pane.record for pane in self.preview.panes), (files[0], files[2]))
+
+    def test_explicit_chooser_order_survives_file_and_group_clicks(self):
+        parent = self.select_file()
+        self.preview.panes[0].chooser.setCurrentIndex(2)
+        pair = tuple(pane.record for pane in self.preview.panes)
+        self.window.tree.setCurrentItem(parent)
+        for record in pair:
+            item = next(parent.child(i) for i in range(parent.childCount())
+                        if parent.child(i).data(0, Qt.ItemDataRole.UserRole) == record)
+            self.window.tree.setCurrentItem(item)
+            self.assertEqual(tuple(pane.record for pane in self.preview.panes), pair)
 
     def test_helper_loads_native_resolution_images_and_zoom_resets(self):
         self.window.show()
@@ -208,9 +245,9 @@ class PreviewTests(FileTestCase):
         self.assertFalse(self.preview.files)
         self.window.preview_toggle.click()
         self.assertTrue(self.preview.files)
-        self.window.workflow_tabs.setCurrentIndex(1)
+        self.window.workflow_tabs.setCurrentWidget(self.window.empty_page)
         self.assertFalse(self.preview.files)
-        self.window.workflow_tabs.setCurrentIndex(0)
+        self.window.workflow_tabs.setCurrentWidget(self.window.duplicate_page)
         self.assertTrue(self.preview.files)
         group.child(0).setCheckState(0, Qt.CheckState.Checked)
         selected = set(self.window.selected)
@@ -367,6 +404,55 @@ class PreviewTests(FileTestCase):
         image = QImage.fromData(data)
         self.assertLessEqual(max(image.width(), image.height()), 320)
         self.assertEqual((metadata["width"], metadata["height"]), (900, 600))
+
+    def test_group_tiles_expand_to_panel_and_resize_without_losing_selection(self):
+        gallery = GroupGallery()
+        self.addCleanup(gallery.close)
+        records = self.window.groups[0].files[:2]
+        gallery.set_group(records, {records[0].path})
+        gallery.resize(900, 400)
+        gallery.show()
+        self.wait_until(lambda: len(gallery.images) == 2)
+        for width, height in ((900, 400), (1200, 600), (400, 600)):
+            gallery.resize(width, height)
+            QTest.qWait(150)
+            area = gallery.viewport().rect()
+            tiles = [gallery.visualItemRect(gallery.item(i)) for i in range(2)]
+            self.assertLessEqual(abs(max(tile.right() for tile in tiles) - area.right()), 4)
+            self.assertLessEqual(abs(max(tile.bottom() for tile in tiles) - area.bottom()), 4)
+            self.assertGreater(gallery.iconSize().width(), 300)
+            for index in range(2):
+                self.assertEqual(gallery.item(index).icon().pixmap(gallery.iconSize()).size(),
+                                 gallery.iconSize())
+            self.assertEqual(gallery.item(0).checkState(), Qt.CheckState.Checked)
+            self.assertEqual(gallery.item(1).checkState(), Qt.CheckState.Unchecked)
+        gallery.grab().save(str(self.root.parent / "responsive-gallery-narrow.png"))
+        gallery.resize(900, 400)
+        QTest.qWait(150)
+        gallery.set_group(tuple(reversed(records)), {records[0].path})
+        self.wait_until(lambda: len(gallery.images) == 2)
+        self.assertEqual(gallery.visualItemRect(gallery.item(0)).top(),
+                         gallery.visualItemRect(gallery.item(1)).top())
+        self.assertEqual(gallery.item(1).checkState(), Qt.CheckState.Checked)
+        gallery.grab().save(str(self.root.parent / "responsive-gallery-wide.png"))
+
+    def test_gallery_thumbnails_fill_box_with_centered_crop(self):
+        self.select_file(group_row=True)
+        gallery = self.preview.gallery
+        gallery.visible = {0}
+        record = gallery.files[0]
+        for width, height in ((100, 300), (300, 100), (20, 20)):
+            with self.subTest(size=(width, height)):
+                image = QImage(width, height, QImage.Format.Format_RGB32)
+                image.fill(QColor("red"))
+                painter = QPainter(image)
+                painter.fillRect(width // 2 - 5, height // 2 - 5, 10, 10, QColor("blue"))
+                painter.end()
+                gallery.loaded(gallery.loaders[0], record, image, "")
+                thumbnail = gallery.item(0).icon().pixmap(gallery.iconSize()).toImage()
+                self.assertEqual(thumbnail.size(), gallery.iconSize())
+                self.assertEqual(thumbnail.pixelColor(95, 70), QColor("blue"))
+                self.assertEqual(thumbnail.pixelColor(0, 0), QColor("red"))
 
     def test_gallery_handles_missing_files_and_replaces_old_group_images(self):
         self.window.show()
