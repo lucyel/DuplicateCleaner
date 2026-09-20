@@ -1,42 +1,18 @@
-"""A self-contained, read-only workflow for visually similar images and videos."""
+"""Read-only results and previews for visually similar images and videos."""
 
-import os
-from threading import Event
-
-from PySide6.QtCore import QThread, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QSize, Qt, QTimer
 from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-    QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QListView, QListWidget,
-    QListWidgetItem, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSplitter,
+    QDialog, QDialogButtonBox, QFrame, QHBoxLayout, QLabel, QListView, QListWidget,
+    QListWidgetItem, QPlainTextEdit, QPushButton, QScrollArea, QSplitter,
     QStackedWidget, QStyle, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from .models import format_bytes
 from .preview import PreviewPane
-from .similarity import PRESETS, SimilarResult, scan_similar
+from .similarity import SimilarResult
 from .video_similarity import VideoFingerprint, preview_frame, timestamp
 from .video_review import VideoComparison
-
-
-class SimilarWorker(QThread):
-    progress = Signal(object)
-    outcome = Signal(object)
-    failed = Signal(str)
-
-    def __init__(self, roots, recursive, exclusions, preset, parent, media_kind="All"):
-        super().__init__(parent)
-        self.roots, self.recursive, self.exclusions, self.preset = roots, recursive, exclusions, preset
-        self.cancel = Event()
-        self.media_kind = media_kind
-
-    def run(self):
-        try:
-            self.outcome.emit(scan_similar(self.roots, self.recursive, excluded_folders=self.exclusions,
-                                          preset=self.preset, cancel=self.cancel, progress=self.progress.emit,
-                                          media_kind=self.media_kind))
-        except Exception as exc:
-            self.failed.emit(f"{type(exc).__name__}: {exc}")
 
 
 class SimilarGallery(QListWidget):
@@ -137,7 +113,7 @@ class SimilarGallery(QListWidget):
 class SimilarTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.worker = None
+        self.busy = False
         self.result = SimilarResult()
         self.current_group = None
         outer = QVBoxLayout(self)
@@ -149,57 +125,14 @@ class SimilarTab(QWidget):
         scroll.setWidget(content)
         outer.addWidget(scroll)
         layout = QVBoxLayout(content)
-        intro = QLabel("Find modified copies of images and videos · Independent, read-only scan")
+        intro = QLabel("Review similar images and videos · Read-only results")
         intro.setObjectName("section")
         layout.addWidget(intro)
         formats = QLabel("Images: JPEG, PNG, BMP, WebP, TIFF. Videos: MP4, M4V, MOV, MKV, AVI, WebM. "
                          "Video matching compares near-complete visual copies; audio is not compared.")
         formats.setWordWrap(True)
         layout.addWidget(formats)
-        scope = QGridLayout()
-        self.folders, self.exclusions = QListWidget(), QListWidget()
-        self.scope_buttons = []
-        for column, (title, listing) in enumerate((("Folders for this scan", self.folders),
-                                                  ("Excluded folders", self.exclusions))):
-            scope.addWidget(QLabel(title), 0, column)
-            listing.setAccessibleName(title)
-            listing.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-            listing.setMaximumHeight(85)
-            scope.addWidget(listing, 1, column)
-            buttons = QHBoxLayout()
-            add, remove = QPushButton("Add folder…"), QPushButton("Remove")
-            add.clicked.connect(lambda checked=False, target=listing: self.pick_folder(target))
-            remove.clicked.connect(lambda checked=False, target=listing: self.remove_folders(target))
-            buttons.addWidget(add)
-            buttons.addWidget(remove)
-            scope.addLayout(buttons, 2, column)
-            self.scope_buttons.extend((add, remove))
-        layout.addLayout(scope)
-        actions = QHBoxLayout()
-        self.recursive = QCheckBox("Include subfolders")
-        self.recursive.setChecked(True)
-        actions.addWidget(self.recursive)
-        self.media_kind = QComboBox()
-        self.media_kind.addItems(["All", "Images", "Videos"])
-        self.media_kind.setAccessibleName("Media types to scan")
-        actions.addWidget(self.media_kind)
-        actions.addWidget(QLabel("Similarity"))
-        self.preset = QComboBox()
-        self.preset.addItems(PRESETS)
-        self.preset.setCurrentText("Balanced")
-        self.preset.setAccessibleName("Image similarity preset")
-        self.preset.setToolTip("Strict: fewer, closer matches. Broad: more candidates, with more false matches.")
-        actions.addWidget(self.preset)
-        actions.addStretch()
-        self.scan_button = QPushButton("Scan similar files")
-        self.scan_button.setObjectName("primary")
-        self.scan_button.clicked.connect(self.start_scan)
-        self.cancel_button = QPushButton("Cancel similarity scan")
-        self.cancel_button.clicked.connect(self.cancel_scan)
-        actions.addWidget(self.scan_button)
-        actions.addWidget(self.cancel_button)
-        layout.addLayout(actions)
-        self.summary = QLabel("Add folders above to start. These folders belong only to Similar files.")
+        self.summary = QLabel("Choose folders in Scan location, enable Similar files in Search criteria, then click Scan.")
         self.summary.setWordWrap(True)
         layout.addWidget(self.summary)
         splitter = QSplitter()
@@ -246,72 +179,28 @@ class SimilarTab(QWidget):
         self.status.setTextFormat(Qt.TextFormat.PlainText)
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
-        self.progress = QProgressBar()
-        layout.addWidget(self.progress)
         self.issues_button = QPushButton("Skipped files / errors (0)")
         self.issues_button.clicked.connect(self.show_issues)
         layout.addWidget(self.issues_button)
         self.update_actions()
 
-    def add_folder(self, path, excluded=False):
-        listing = self.exclusions if excluded else self.folders
-        path = os.path.abspath(path)
-        if all(os.path.normcase(listing.item(i).text()) != os.path.normcase(path) for i in range(listing.count())):
-            listing.addItem(path)
-        self.update_actions()
-
-    def pick_folder(self, listing):
-        path = QFileDialog.getExistingDirectory(self, "Choose similarity scan folder")
-        if path:
-            self.add_folder(path, listing is self.exclusions)
-
-    def remove_folders(self, listing):
-        for item in listing.selectedItems():
-            listing.takeItem(listing.row(item))
+    def set_busy(self, busy):
+        self.busy = busy
+        self.tree.setEnabled(not busy)
         self.update_actions()
 
     def update_actions(self):
-        busy = self.worker is not None
-        for widget in (*self.scope_buttons, self.folders, self.exclusions, self.recursive, self.preset, self.tree,
-                       self.media_kind):
-            widget.setEnabled(not busy)
-        self.scan_button.setEnabled(not busy and self.folders.count() > 0)
-        self.cancel_button.setEnabled(busy and not self.worker.cancel.is_set())
         self.issues_button.setEnabled(bool(self.result.issues))
         self.issues_button.setText(f"Skipped files / errors ({len(self.result.issues)})")
-        self.back_button.setEnabled(not busy and self.current_group is not None)
+        self.back_button.setEnabled(not self.busy and self.current_group is not None)
 
-    def start_scan(self):
-        if self.worker is not None or not self.folders.count():
-            return
-        roots = [self.folders.item(i).text() for i in range(self.folders.count())]
-        exclusions = [self.exclusions.item(i).text() for i in range(self.exclusions.count())]
+    def prepare_scan(self):
         self.clear_preview()
         self.tree.clear()
         self.result = SimilarResult()
-        self.summary.setText("Scanning similar files…")
-        self.progress.setRange(0, 0)
-        self.worker = SimilarWorker(roots, self.recursive.isChecked(), exclusions, self.preset.currentText(), self,
-                                    self.media_kind.currentText())
-        self.worker.progress.connect(self.on_progress)
-        self.worker.outcome.connect(self.on_result)
-        self.worker.failed.connect(self.on_failure)
-        self.worker.finished.connect(self.job_finished)
+        self.summary.setText("Waiting for similarity scan…")
+        self.status.setText("The shared scan progress is shown below.")
         self.update_actions()
-        self.worker.start()
-
-    def cancel_scan(self):
-        if self.worker:
-            self.worker.cancel.set()
-            self.status.setText("Stopping similarity scan…")
-            self.update_actions()
-
-    def on_progress(self, progress):
-        self.status.setText(f"{progress.stage} · {progress.completed}"
-                            + (f" / {progress.total}" if progress.total else "")
-                            + (f"\n{progress.path}" if progress.path else ""))
-        self.progress.setRange(0, progress.total if progress.total else 0)
-        self.progress.setValue(progress.completed)
 
     def on_result(self, result):
         self.result = result
@@ -340,13 +229,6 @@ class SimilarTab(QWidget):
     def on_failure(self, message):
         self.status.setText("Similarity scan failed: " + message)
         self.summary.setText("Scan failed. Check the error below before trying again.")
-
-    def job_finished(self):
-        worker, self.worker = self.worker, None
-        worker.deleteLater()
-        self.progress.setRange(0, 1)
-        self.progress.setValue(1)
-        self.update_actions()
 
     def review_selection(self):
         item = self.tree.currentItem()

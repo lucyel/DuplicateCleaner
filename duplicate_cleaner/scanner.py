@@ -8,6 +8,7 @@ from time import monotonic
 from typing import BinaryIO, Callable, Iterable
 
 from .files import capture, check_location, ensure_current, open_checked, open_named_streams, UnsafeFile
+from .file_types import accepts_file, validate_file_types
 from .matching import candidate_key, compatible
 from .models import Cancelled, DuplicateGroup, FileRecord, Issue, Progress, ScanResult, SearchCriteria
 
@@ -131,6 +132,7 @@ def differing_named_streams(left: FileRecord, first: dict[str, BinaryIO],
 def scan(roots: Iterable[Path | str], recursive: bool = True, *,
          excluded_folders: Iterable[Path | str] = (),
          criteria: SearchCriteria = SearchCriteria(),
+         file_types: Iterable[str] | None = None,
          cancel: Event | None = None,
          progress: Callable[[Progress], None] | None = None) -> ScanResult:
     if not criteria.enabled:
@@ -138,6 +140,7 @@ def scan(roots: Iterable[Path | str], recursive: bool = True, *,
     if criteria.size_tolerance < 0 or criteria.text_tolerance < 0 or criteria.folder_depth < 1:
         raise ValueError("Tolerances must be nonnegative and folder depth must be positive")
     result = ScanResult()
+    file_types = validate_file_types(file_types)
     reporter = Reporter(cancel if cancel is not None else Event(), progress)
     by_match: dict[tuple, list[FileRecord]] = defaultdict(list)
     seen_dirs: set[tuple[int, int]] = set()
@@ -178,6 +181,8 @@ def scan(roots: Iterable[Path | str], recursive: bool = True, *,
                             if entry.is_dir(follow_symlinks=False):
                                 if recursive:
                                     stack.append(path)
+                                continue
+                            if not accepts_file(path, file_types):
                                 continue
                             record = capture(path)
                             identity = (record.device, record.inode)

@@ -48,8 +48,8 @@ Use the **sun/moon icon** in the top-right corner to switch between light and da
 
 ## Use
 
-1. Open **Scan location** and click **Add folder** for each folder you want to compare. Subfolders are included by default; uncheck **Include subfolders** to scan only the explicitly selected folders. In **Excluded subfolders**, click **+ Exclude…** to choose a subfolder inside an added folder. Both scan tools skip that folder and everything inside it, even if it is also added as a scan root. Select exclusions and click **Remove** to include them again. Removing a scan folder clears exclusions that no longer belong to any remaining root. Exclusion changes apply to the next scan; existing results stay available.
-2. Choose the matching checkboxes in **Search criteria**, then click **Scan for duplicates**. The status shows the current stage, files processed, bytes read, and current path. Cancel stops after the current read or Windows operation returns.
+1. Open **Scan location** and click **Add folder** for each folder you want to compare. This first tab is the only place to configure scan folders. Subfolders are included by default; uncheck **Include subfolders** to scan only the explicitly selected folders. In **Excluded subfolders**, click **+ Exclude…** to choose a subfolder inside an added folder. All selected scan modes skip that folder and everything inside it, even if it is also added as a scan root. Select exclusions and click **Remove** to include them again. Removing a scan folder clears exclusions that no longer belong to any remaining root. Exclusion changes apply to the next scan; existing results stay available.
+2. In **Search criteria**, choose one or more modes (**Duplicate files**, **Similar files**, **Empty folders**) and the file types to scan, then click **Scan**. Only the chosen modes run. The status shows the current mode and stage, files or folders processed, bytes read, and current path. Cancel stops the current scan and prevents queued modes from starting; completed modes keep their results.
 3. Expand a duplicate group and click a file row to show its details: name, type, full path, exact size, dates, verified SHA-256, and recycling-selection status. The details text can be selected and copied. Resize the divider between the list and details as needed. Selecting a row does not check its recycling checkbox.
 4. Check only the files you want to recycle. You may select **every copy in a group**; no copy is kept automatically. Leave a file unchecked only if you want to keep it. To check all listed matches in one exact folder, highlight one of its file rows and use **Select this folder's duplicates**, or right-click the row and choose **Select all duplicates in this folder**.
 5. Click **Recycle selected files**. The confirmation warns when every copy in a group is selected. Its details list exactly which files are selected and which copies, if any, will remain. Cancel is the default choice.
@@ -61,9 +61,13 @@ Checked files stay selected when switching tabs. The selection count and recycli
 
 ### Search criteria and scan location
 
-The top tabs are **Duplicate files**, **Search criteria**, **Scan location**, and **Empty folders**. Folder roots, excluded subfolders, and recursion settings live in **Scan location**. Scan, save-session, and load-session actions remain available below every tab.
+The top tabs are **Scan location**, **Search criteria**, **Duplicate files**, **Similar files**, and **Empty folders**. Folder roots, excluded subfolders, and recursion settings live only in **Scan location**. Scan, save-session, and load-session actions remain available below every tab.
 
-**Search criteria** applies before a scan; all checked criteria must match. **Same file size**, **Same file hash (SHA-256)**, and **Byte-for-byte comparison** are independent controls. All three start checked to retain the original size → sample → SHA-256 → byte verification scan. Hash-only mode does not compare every byte; byte-only mode compares bytes without calculating main-file hashes. Hash or byte matching always requires equal main-file sizes, so size tolerance is available only when both are off.
+**Search criteria** contains the scan-mode checkboxes; **Duplicate files** is selected by default. Select any combination of modes to run them sequentially with the same folders, exclusions, and recursion setting. Each run captures the settings when you click **Scan**. A failed mode reports its error while the remaining selected modes continue. Unselected modes retain their existing results and selections. At least one mode must be selected.
+
+**All file types** is the default. Choose one or more of **Videos**, **Images**, **Archives**, **Documents**, **Audio**, and **Other** to scan only those categories. Selecting a category turns off All; selecting All clears the individual choices. Categories use filename extensions, ignoring capitalization. Hover over a category to see its extensions; Other includes unknown extensions and files without an extension. Excluded file types are skipped during discovery, before files are opened or hashed. Duplicate and similarity scans require at least one type or All. Similarity only compares supported images and videos within the selected types. Empty-folder scans always inspect every entry: a folder containing an ignored file type is never considered empty.
+
+The duplicate comparison options in **Search criteria** apply only to **Duplicate files**; all checked comparison criteria must match. **Same file size**, **Same file hash (SHA-256)**, and **Byte-for-byte comparison** are independent controls. All three start checked to retain the original size → sample → SHA-256 → byte verification scan. Hash-only mode does not compare every byte; byte-only mode compares bytes without calculating main-file hashes. Hash or byte matching always requires equal main-file sizes, so size tolerance is available only when both are off.
 
 Additional options:
 
@@ -115,7 +119,7 @@ Files can be restored using the Windows Recycle Bin. **Space is not freed until 
 
 ### Empty folders
 
-The **Empty folders** tab is a separate cleanup tool. It uses the folders in the left panel and the **Include subfolders** setting, but it does not scan file contents, alter duplicate results, or share their checkboxes. Click **Scan empty folders**, review the full paths, and manually check only the folders you want to recycle. Nothing is checked automatically.
+Enable **Empty folders** in **Search criteria**, then click the shared **Scan** button. This mode uses the folders and **Include subfolders** setting from **Scan location**. It inspects all entries regardless of the selected file types, without reading file contents. Review the full paths in the **Empty folders** results tab and manually check only the folders you want to recycle. These checkboxes and cleanup actions are separate from duplicate-file cleanup. Nothing is checked automatically.
 
 A folder qualifies only when it contains no entries at all: no files and no child folders, including hidden entries. The explicitly selected scan roots are never offered for deletion. Links, junctions, reparse points, unsafe paths, inaccessible folders, and paths without reliable filesystem identity are skipped and reported in this tab's own error list. With **Include subfolders** off, only direct child folders of each selected root are checked.
 
@@ -144,7 +148,7 @@ Drag the divider to give the preview more room, use **Hide preview** to reclaim 
 
 ## Similar files
 
-The **Similar files** tab has its own folders, exclusions, subfolder option, scan/cancel controls, results, and previews. Add folders inside that tab, choose **All**, **Images**, or **Videos**, choose **Strict**, **Balanced** (default), or **Broad**, and click **Scan similar files**. The media selector applies to the next scan. The existing scan location, search criteria, filters, checked files, cleanup, and saved sessions do not control or receive these results. Similarity results are read-only and are not included in saved duplicate sessions.
+Enable **Similar files** in **Search criteria**, select **All file types**, **Images**, **Videos**, or both media categories, and choose **Strict**, **Balanced** (default), or **Broad** under **Similarity options**. Click the shared **Scan** button to use the folders, exclusions, and subfolder option from **Scan location**. The **Similar files** tab displays the resulting groups and previews. Duplicate comparison criteria do not affect similarity matching. Similarity results are read-only, have no recycling actions, and are not included in saved duplicate sessions.
 
 Image matching supports JPEG, PNG, BMP, WebP, and TIFF. It looks for resized, recompressed, or lightly edited copies, including copies with different filenames and byte sizes. Exact copies can also appear. Click a group to see every image in a scrollable gallery; select a file or double-click a gallery image to compare it with the reference using zoom, pan, Fit, and 100% controls. Larger images are preferred as group references; this does not establish which copy is the original or best quality.
 
@@ -238,10 +242,12 @@ Run those integration tests from a normal user terminal with Recycle Bin access.
 ## Source layout
 
 - `duplicate_cleaner/scanner.py`: discovery, staged comparison, progress, cancellation.
+- `duplicate_cleaner/scan_workflow.py`: shared settings, selected-mode execution, progress, and cancellation.
+- `duplicate_cleaner/file_types.py`: shared extension categories for scan selection and result filters.
 - `duplicate_cleaner/files.py`: file identity, path checks, Windows read locks, extra-stream checks.
 - `duplicate_cleaner/cleanup.py`: selection validation and pre-recycle verification.
 - `duplicate_cleaner/empty_folders.py`: independent empty-folder discovery, validation, and recycling.
-- `duplicate_cleaner/similarity.py` and `similar_tab.py`: independent image-similarity scanning and read-only review.
+- `duplicate_cleaner/similarity.py` and `similar_tab.py`: image/video similarity scanning and read-only results review.
 - `duplicate_cleaner/video_similarity.py` and `video_review.py`: video fingerprints, matching evidence, and sampled-frame review inside Similar files.
 - `duplicate_cleaner/windows_trash.py`: Windows Shell recycling and permanent-delete veto.
 - `duplicate_cleaner/gui.py`: desktop interface and background workers.

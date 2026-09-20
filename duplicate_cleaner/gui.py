@@ -19,35 +19,17 @@ from PySide6.QtWidgets import (
 
 from .cleanup import recycle_selected
 from .empty_folders import (EmptyFolderRecord, EmptyFolderRecycleResult, EmptyFolderScanResult,
-                            ensure_empty_folder_current, recycle_empty_folders, scan_empty_folders)
+                            ensure_empty_folder_current, recycle_empty_folders)
 from .files import ensure_current
+from .file_types import FILE_TYPES, file_type
+from .scan_workflow import SCAN_MODES, run_selected_scans
+from .similarity import PRESETS
 from .models import DuplicateGroup, FileRecord, Progress, RecycleResult, ScanResult, SearchCriteria, format_bytes
 from .preview import ComparisonPreview
-from .scanner import scan
 from .similar_tab import SimilarTab
 from .sessions import (LoadResult, SaveResult, SessionData, load_session as load_session_file,
                        save_session as save_session_file)
 from .thumbnails import ThumbnailController
-
-
-FILE_TYPES = {
-    "Videos": {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".webm", ".m4v", ".mpg", ".mpeg",
-               ".ts", ".mts", ".m2ts", ".flv", ".vob", ".3gp", ".ogv"},
-    "Images": {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tif", ".tiff", ".heic",
-               ".heif", ".avif", ".ico", ".svg", ".raw", ".cr2", ".cr3", ".nef", ".arw", ".dng", ".psd"},
-    "Archives": {".zip", ".zipx", ".7z", ".rar", ".tar", ".gz", ".bz2", ".xz", ".tgz",
-                 ".tbz2", ".txz", ".zst", ".cab", ".iso"},
-    "Documents": {".pdf", ".doc", ".docx", ".docm", ".odt", ".rtf", ".txt", ".md",
-                  ".xls", ".xlsx", ".xlsm", ".ods", ".csv", ".ppt", ".pptx", ".pptm",
-                  ".odp", ".epub", ".mobi"},
-    "Audio": {".mp3", ".wav", ".flac", ".aac", ".m4a", ".ogg", ".opus", ".wma", ".aiff",
-              ".aif", ".alac", ".ape", ".mid", ".midi"},
-}
-
-
-def file_type(path: Path) -> str:
-    extension = path.suffix.casefold()
-    return next((name for name, extensions in FILE_TYPES.items() if extension in extensions), "Other")
 
 
 def parse_filter_terms(value: str, *, path: bool = False) -> tuple[tuple[str, bool], ...]:
@@ -352,7 +334,7 @@ class MainWindow(QMainWindow):
         self.excluded_folders = QListWidget()
         self.excluded_folders.setAccessibleName("Excluded subfolders")
         self.excluded_folders.setToolTip(
-            "These subfolders and everything inside them are skipped by both scans. "
+            "These subfolders and everything inside them are skipped by all selected scans. "
             "Changes apply to the next scan.")
         self.excluded_folders.setMinimumHeight(60)
         self.excluded_folders.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -371,7 +353,7 @@ class MainWindow(QMainWindow):
         self.recursive = QCheckBox("Include subfolders")
         self.recursive.setChecked(True)
         side.addWidget(self.recursive)
-        self.scan_button = QPushButton("Scan for duplicates")
+        self.scan_button = QPushButton("Scan")
         self.scan_button.setToolTip("Scanning never changes files. Links and unsafe files are skipped.")
         self.scan_button.setObjectName("primary")
         self.scan_button.clicked.connect(self.start_scan)
@@ -404,9 +386,48 @@ class MainWindow(QMainWindow):
         self.criteria_page = QWidget()
         criteria_layout = QVBoxLayout(self.criteria_page)
         criteria_layout.setContentsMargins(12, 12, 12, 12)
-        criteria_help = QLabel("All checked criteria must match. Changes apply to the next scan.")
+        criteria_help = QLabel("Choose one or more scan modes and file types, then click Scan. Folders are configured in Scan location.")
         criteria_help.setWordWrap(True)
         criteria_layout.addWidget(criteria_help)
+        modes_box = QGroupBox("Scan modes")
+        mode_layout = QHBoxLayout(modes_box)
+        self.mode_checks = {}
+        for mode, title in SCAN_MODES.items():
+            checkbox = QCheckBox(title)
+            checkbox.setChecked(mode == "duplicates")
+            checkbox.toggled.connect(self.update_actions)
+            self.mode_checks[mode] = checkbox
+            mode_layout.addWidget(checkbox)
+        criteria_layout.addWidget(modes_box)
+        self.file_types_box = QGroupBox("File types to scan")
+        types_layout = QGridLayout(self.file_types_box)
+        self.all_file_types = QCheckBox("All file types")
+        self.all_file_types.setChecked(True)
+        self.all_file_types.toggled.connect(self.all_types_changed)
+        types_layout.addWidget(self.all_file_types, 0, 0, 1, 3)
+        self.file_type_checks = {}
+        for index, name in enumerate((*FILE_TYPES, "Other")):
+            checkbox = QCheckBox(name)
+            checkbox.setToolTip(", ".join(sorted(FILE_TYPES[name])) if name in FILE_TYPES
+                                else "All remaining extensions, including files with no extension")
+            checkbox.toggled.connect(self.file_types_changed)
+            self.file_type_checks[name] = checkbox
+            types_layout.addWidget(checkbox, 1 + index // 3, index % 3)
+        type_help = QLabel("Types are selected by file extension. Empty-folder scans always inspect every entry.\n"
+                           "Similarity supports decodable images and videos only; other chosen types are skipped.")
+        type_help.setWordWrap(True)
+        types_layout.addWidget(type_help, 3, 0, 1, 3)
+        criteria_layout.addWidget(self.file_types_box)
+        self.similarity_options = QGroupBox("Similarity options")
+        similarity_layout = QHBoxLayout(self.similarity_options)
+        similarity_layout.addWidget(QLabel("Similarity"))
+        self.similarity_preset = QComboBox()
+        self.similarity_preset.addItems(PRESETS)
+        self.similarity_preset.setCurrentText("Balanced")
+        self.similarity_preset.setAccessibleName("Image and video similarity preset")
+        similarity_layout.addWidget(self.similarity_preset)
+        similarity_layout.addStretch()
+        criteria_layout.addWidget(self.similarity_options)
         self.criteria_checks = {}
         defaults = SearchCriteria()
 
@@ -424,7 +445,7 @@ class MainWindow(QMainWindow):
             line.addStretch()
             parent.addLayout(line)
 
-        content_box = QGroupBox("File contents")
+        content_box = QGroupBox("Duplicate comparison — file contents")
         content_options = QVBoxLayout(content_box)
         row(content_options,
             check("hashes", "Same file hash (SHA-256)", "Compare full main-file SHA-256 hashes. Hash matching requires equal size."),
@@ -460,7 +481,7 @@ class MainWindow(QMainWindow):
             check("from_search_root", "Match from search root", "Compare relative folder paths below each scan root. For overlapping roots, use the most specific root."))
         row(options, check("ignore_same_folder", "Ignore duplicate groups within the same folder", "Hide groups where all files have the same parent folder. Groups spanning folders retain all copies."))
         criteria_layout.addWidget(options_box)
-        text_box = QGroupBox("Text matching options")
+        text_box = QGroupBox("Duplicate comparison — text options")
         text_options = QVBoxLayout(text_box)
         self.text_tolerance = QSpinBox()
         self.text_tolerance.setRange(0, 255)
@@ -469,6 +490,7 @@ class MainWindow(QMainWindow):
         row(text_options, check("case_sensitive", "Is case sensitive", "Apply case-sensitive comparisons to filename, extension, folder names, and Copy markers."),
             self.text_tolerance, QLabel("Similar text — tolerance"))
         criteria_layout.addWidget(text_box)
+        self.duplicate_criteria_boxes = (content_box, options_box, text_box)
         self.criteria_hint = QLabel()
         self.criteria_hint.setWordWrap(True)
         self.criteria_hint.setObjectName("hint")
@@ -680,12 +702,6 @@ class MainWindow(QMainWindow):
         empty_section.setObjectName("section")
         empty_heading.addWidget(empty_section)
         empty_heading.addStretch()
-        self.empty_scan_button = QPushButton("Scan empty folders")
-        self.empty_scan_button.setObjectName("primary")
-        self.empty_scan_button.setToolTip(
-            "Use the chosen folders and Include subfolders setting. Duplicate results are not changed.")
-        self.empty_scan_button.clicked.connect(self.start_empty_folder_scan)
-        empty_heading.addWidget(self.empty_scan_button)
         empty_content.addLayout(empty_heading)
         self.empty_folder_hint = QLabel(
             "Only truly empty folders are listed. Selected scan roots, links, and junctions are excluded.\n"
@@ -769,16 +785,38 @@ class MainWindow(QMainWindow):
         self.workflow_tabs.currentChanged.connect(self.update_details)
         self.workflow_tabs.currentChanged.connect(self.update_similarity_controls)
         self.update_actions()
+        self.update_similarity_controls()
 
     def update_similarity_controls(self):
         separate = self.workflow_tabs.currentWidget() is self.similar_tab
-        for widget in (self.scan_button, self.save_session_button, self.load_session_button,
-                       self.status, self.cancel_button, self.current_path, self.progress_bar, self.filter_toggle):
-            widget.setVisible(not separate)
+        self.filter_toggle.setVisible(self.workflow_tabs.currentWidget() is self.duplicate_page)
         if not separate:
             self.similar_tab.clear_preview()
         else:
             self.similar_tab.review_selection()
+
+    def selected_modes(self):
+        return tuple(mode for mode, checkbox in self.mode_checks.items() if checkbox.isChecked())
+
+    def selected_file_types(self):
+        if self.all_file_types.isChecked():
+            return None
+        return tuple(name for name, checkbox in self.file_type_checks.items() if checkbox.isChecked())
+
+    def all_types_changed(self, checked):
+        if checked:
+            for checkbox in self.file_type_checks.values():
+                previous = checkbox.blockSignals(True)
+                checkbox.setChecked(False)
+                checkbox.blockSignals(previous)
+        self.update_actions()
+
+    def file_types_changed(self, checked):
+        if checked:
+            previous = self.all_file_types.blockSignals(True)
+            self.all_file_types.setChecked(False)
+            self.all_file_types.blockSignals(previous)
+        self.update_actions()
 
     def search_criteria(self):
         return SearchCriteria(**{key: check.isChecked() for key, check in self.criteria_checks.items()},
@@ -865,6 +903,13 @@ class MainWindow(QMainWindow):
     def update_actions(self):
         busy = self.worker is not None
         criteria = self.search_criteria()
+        modes = self.selected_modes()
+        file_modes = any(mode != "empty" for mode in modes)
+        self.file_types_box.setEnabled(file_modes)
+        self.similarity_options.setEnabled("similarity" in modes)
+        for box in self.duplicate_criteria_boxes:
+            box.setEnabled("duplicates" in modes)
+        self.similar_tab.set_busy(busy)
         self.criteria_page.setEnabled(not busy)
         for key, enabled in (
                 ("ignore_copy", criteria.filename or criteria.similar_names),
@@ -876,7 +921,10 @@ class MainWindow(QMainWindow):
         self.folder_depth.setEnabled(criteria.folder and criteria.folder_depth_enabled)
         self.text_tolerance.setEnabled(criteria.similar_names)
         self.criteria_hint.setText(
-            "Choose at least one criterion to enable scanning." if not criteria.enabled else
+            "Choose at least one scan mode." if not modes else
+            "Choose at least one file type or All file types." if file_modes and self.selected_file_types() == () else
+            "Choose at least one duplicate comparison criterion." if "duplicates" in modes and not criteria.enabled else
+            "Only the selected modes will run. Scanning never changes files." if "duplicates" not in modes else
             "Contents are verified byte for byte before files appear as duplicates." if criteria.contents else
             "Hashes match, but bytes are not compared during scanning. Recycling still verifies contents." if criteria.hashes else
             "Results are possible matches only. Contents must still match before recycling.")
@@ -886,8 +934,9 @@ class MainWindow(QMainWindow):
             widget.setEnabled(not busy)
         self.exclude_button.setEnabled(not busy and self.folders.count() > 0)
         self.remove_exclusion_button.setEnabled(not busy and bool(self.excluded_folders.selectedItems()))
-        self.scan_button.setEnabled(not busy and self.folders.count() > 0 and criteria.enabled)
-        self.empty_scan_button.setEnabled(not busy and self.folders.count() > 0)
+        self.scan_button.setEnabled(not busy and self.folders.count() > 0 and bool(modes)
+                                    and ("duplicates" not in modes or criteria.enabled)
+                                    and (not file_modes or self.selected_file_types() != ()))
         self.save_session_button.setEnabled(not busy and self.session_available)
         self.load_session_button.setEnabled(not busy)
         self.cancel_button.setEnabled(busy and not self.worker.cancel_event.is_set())
@@ -1103,44 +1152,63 @@ class MainWindow(QMainWindow):
         self.worker.start()
 
     def start_scan(self):
-        criteria = self.search_criteria()
-        if self.worker is not None or not self.folders.count() or not criteria.enabled:
+        modes, types, criteria = self.selected_modes(), self.selected_file_types(), self.search_criteria()
+        if (self.worker is not None or not self.folders.count() or not modes
+                or ("duplicates" in modes and not criteria.enabled)
+                or (any(mode != "empty" for mode in modes) and types == ())):
             return
-        self.workflow_tabs.setCurrentWidget(self.duplicate_page)
-        roots = [self.folders.item(i).text() for i in range(self.folders.count())]
-        recursive = self.recursive.isChecked()
-        exclusions = self.excluded_folder_paths()
-        self.session_available = False
-        self.session_path = None
-        self.scan_file_count = 0
-        self.scan_total_bytes = 0
-        self.summary_notice = "Scanning your folders…"
-        self.set_groups([])
-        self.issues = []
-        self.empty.setText("Checking size → samples → SHA-256 → every byte. No files will be changed."
-                           if criteria.contents and criteria.hashes else
-                           "Comparing files byte for byte." if criteria.contents else
-                           "Comparing SHA-256 hashes. Bytes will be verified before recycling." if criteria.hashes else
-                           "Matching the selected criteria. File contents are not verified.")
-        self.start_job(lambda **kwargs: scan(roots, recursive, excluded_folders=exclusions, criteria=criteria, **kwargs),
-                       self.on_scan)
+        roots = tuple(self.folders.item(i).text() for i in range(self.folders.count()))
+        recursive, exclusions = self.recursive.isChecked(), self.excluded_folder_paths()
+        preset = self.similarity_preset.currentText()
+        self._scan_modes_running = modes
+        self.similar_tab.clear_preview()
+        if "duplicates" in modes:
+            self.session_available = False
+            self.session_path = None
+            self.scan_file_count = self.scan_total_bytes = 0
+            self.summary_notice = "Scanning your folders…"
+            self.set_groups([])
+            self.issues = []
+            self.empty.setText("Comparing the selected file types using your duplicate criteria. No files will be changed.")
+        if "similarity" in modes:
+            self.similar_tab.prepare_scan()
+        if "empty" in modes:
+            self.set_empty_folders([])
+            self.empty_folder_issues = []
+            self.empty_folder_summary.setText("Waiting for empty-folder scan…")
+            self.empty_folder_hint.setText("Every entry is inspected, regardless of the chosen file types.")
+        pages = {"duplicates": self.duplicate_page, "similarity": self.similar_tab, "empty": self.empty_page}
+        self.workflow_tabs.setCurrentWidget(pages[modes[0]])
+        self.status.setText("Starting selected scans…")
+        self.start_job(lambda **kwargs: run_selected_scans(roots, recursive, modes=modes,
+            excluded_folders=exclusions, file_types=types, criteria=criteria, preset=preset, **kwargs),
+            self.on_scan_run)
 
-    def start_empty_folder_scan(self):
-        if self.worker is not None or not self.folders.count():
-            return
-        self.workflow_tabs.setCurrentWidget(self.empty_page)
-        roots = [self.folders.item(index).text() for index in range(self.folders.count())]
-        recursive = self.recursive.isChecked()
-        exclusions = self.excluded_folder_paths()
-        self.set_empty_folders([])
-        self.empty_folder_issues = []
-        self.empty_folder_summary.setText("Checking for empty folders…")
-        self.empty_folder_hint.setText(
-            "Scanning folder entries only. Duplicate files and duplicate results are not inspected or changed.")
-        self.start_job(
-            lambda **kwargs: scan_empty_folders(roots, recursive, excluded_folders=exclusions, **kwargs),
-            self.on_empty_folder_scan, self.on_empty_folder_failure,
-        )
+    def on_scan_run(self, outcome):
+        handlers = {"duplicates": self.on_scan, "similarity": self.similar_tab.on_result,
+                    "empty": self.on_empty_folder_scan}
+        messages = []
+        for mode in self._scan_modes_running:
+            title = SCAN_MODES[mode]
+            if mode in outcome.results:
+                result = outcome.results[mode]
+                handlers[mode](result)
+                count = len(result.folders) if mode == "empty" else len(result.groups)
+                messages.append(f"{title}: cancelled" if result.cancelled else
+                                f"{title}: {count} {'folders' if mode == 'empty' else 'groups'}")
+                continue
+            message = ("Scan failed: " + outcome.errors[mode]) if mode in outcome.errors else "Not run — scan cancelled"
+            messages.append(f"{title}: {message}")
+            if mode == "duplicates":
+                self.summary_notice = message
+                self.set_groups([])
+            elif mode == "similarity":
+                self.similar_tab.summary.setText(message)
+                self.similar_tab.status.setText(message)
+            else:
+                self.empty_folder_summary.setText(message)
+        state = "Cancelled" if outcome.cancelled else "Finished with errors" if outcome.errors else "Scan complete"
+        self.status.setText(state + " · " + " · ".join(messages))
 
     def save_session(self):
         if self.worker is not None or not self.session_available:
@@ -1465,7 +1533,8 @@ class MainWindow(QMainWindow):
                                 f"Windows could not open this file. Check its default app association.\n\n{record.path}")
 
     def on_progress(self, progress: Progress):
-        unit = "folders" if "folder" in progress.stage.casefold() else "files"
+        stage = progress.stage.casefold()
+        unit = "frames" if "frames" in stage else "folders" if "folder" in stage else "files"
         self.status.setText(f"{progress.stage}  ·  {progress.completed:,}"
                             + (f" / {progress.total:,} {unit}" if progress.total else f" {unit}")
                             + (f"  ·  {format_bytes(progress.bytes_read)} read"
@@ -1810,13 +1879,6 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Could not open folder", str(record.path))
 
     def closeEvent(self, event: QCloseEvent):
-        if self.similar_tab.worker is not None:
-            self.similar_tab.cancel_scan()
-            self.similar_tab.status.setText("Stopping safely. Close the window again once the scan has stopped.")
-            if self.worker is not None:
-                self.cancel_work()
-            event.ignore()
-            return
         if self.worker is not None:
             self.cancel_work()
             event.ignore()

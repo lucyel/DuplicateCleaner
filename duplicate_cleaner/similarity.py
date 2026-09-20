@@ -15,6 +15,7 @@ from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QImage, QImageReader, QPainter
 
 from .files import capture, check_location, ensure_current, open_checked
+from .file_types import accepts_file, validate_file_types
 from .models import Cancelled, FileRecord, Issue, Progress
 from .thumbnails import _binary_pipe
 from .video_similarity import VIDEO_SUFFIXES, VideoGroup, group_videos, read_video_fingerprint
@@ -216,7 +217,7 @@ def group_images(images, radius, cancel, progress=None):
 
 
 def scan_similar(roots, recursive=True, *, excluded_folders=(), preset="Balanced", cancel=None, progress=None,
-                 media_kind="Images"):
+                 media_kind="Images", file_types=None):
     if preset not in PRESETS:
         raise ValueError("Choose Strict, Balanced, or Broad similarity")
     if media_kind not in ("All", "Images", "Videos"):
@@ -224,6 +225,7 @@ def scan_similar(roots, recursive=True, *, excluded_folders=(), preset="Balanced
     suffixes = (IMAGE_SUFFIXES if media_kind != "Videos" else set()) | (VIDEO_SUFFIXES if media_kind != "Images" else set())
     cancel = cancel if cancel is not None else Event()
     result = SimilarResult()
+    file_types = validate_file_types(file_types)
     exclusions = {Path(os.path.abspath(path)) for path in excluded_folders}
     stack = [Path(os.path.abspath(path)) for path in roots]
     seen_dirs, seen_files, records = set(), set(), []
@@ -271,7 +273,7 @@ def scan_similar(roots, recursive=True, *, excluded_folders=(), preset="Balanced
                             if entry.is_dir(follow_symlinks=False):
                                 if recursive:
                                     stack.append(path)
-                            elif path.suffix.casefold() in suffixes:
+                            elif path.suffix.casefold() in suffixes and accepts_file(path, file_types):
                                 record = capture(path)
                                 identity = (record.device, record.inode)
                                 if identity not in seen_files:

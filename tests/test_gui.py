@@ -36,11 +36,12 @@ class GuiTests(FileTestCase):
             self.window.choose_excluded_folder()
             self.window.choose_excluded_folder()
         self.assertEqual(self.window.excluded_folder_paths(), (folder,))
-        for method, scanner in ((self.window.start_scan, "scan"),
-                                (self.window.start_empty_folder_scan, "scan_empty_folders")):
+        for mode, scanner in (("duplicates", "scan"), ("empty", "scan_empty_folders")):
+            for key, checkbox in self.window.mode_checks.items():
+                checkbox.setChecked(key == mode)
             with patch.object(self.window, "start_job") as start:
-                method()
-            with patch(f"duplicate_cleaner.gui.{scanner}") as scan_job:
+                self.window.start_scan()
+            with patch(f"duplicate_cleaner.scan_workflow.{scanner}") as scan_job:
                 start.call_args.args[0]()
             self.assertEqual(scan_job.call_args.kwargs["excluded_folders"], (folder,))
         self.window.excluded_folders.item(0).setSelected(True)
@@ -581,7 +582,7 @@ class GuiTests(FileTestCase):
             for index in (0, 1, 3, 4, 2):
                 self.window.workflow_tabs.setCurrentIndex(index)
                 QTest.qWait(20)
-                self.assertEqual(self.window.scan_button.isVisible(), index != 3)
+                self.assertTrue(self.window.scan_button.isVisible())
                 self.assertEqual(self.window.folders.isVisible(), index == 0)
         self.assertEqual(self.window.selected, selected)
         self.assertEqual(self.window.groups, groups)
@@ -602,7 +603,7 @@ class GuiTests(FileTestCase):
         self.assertIs(self.window.workflow_tabs.currentWidget(), self.window.duplicate_page)
         job = start.call_args.args[0]
         self.window.criteria_checks["contents"].setChecked(True)
-        with patch("duplicate_cleaner.gui.scan") as scanner:
+        with patch("duplicate_cleaner.scan_workflow.scan") as scanner:
             job()
         criteria = scanner.call_args.kwargs["criteria"]
         self.assertTrue(criteria.filename)
@@ -633,7 +634,7 @@ class GuiTests(FileTestCase):
             widget.setValue(value)
         with patch.object(self.window, "start_job") as start:
             self.window.start_scan()
-        with patch("duplicate_cleaner.gui.scan") as scanner:
+        with patch("duplicate_cleaner.scan_workflow.scan") as scanner:
             start.call_args.args[0]()
         criteria = scanner.call_args.kwargs["criteria"]
         self.assertEqual((criteria.size_tolerance, criteria.folder_depth, criteria.text_tolerance), size_values)
@@ -1096,8 +1097,10 @@ class GuiTests(FileTestCase):
         folder = self.root / "empty"
         folder.mkdir()
         duplicate_groups = list(self.window.groups)
-        self.window.start_empty_folder_scan()
-        self.assertFalse(self.window.empty_scan_button.isEnabled())
+        self.window.mode_checks["duplicates"].setChecked(False)
+        self.window.mode_checks["empty"].setChecked(True)
+        self.window.start_scan()
+        self.assertFalse(self.window.scan_button.isEnabled())
         self.assertFalse(self.window.empty_folder_tree.isEnabled())
         self.assertTrue(self.window.cancel_button.isEnabled())
         loop = QEventLoop()
@@ -1107,7 +1110,7 @@ class GuiTests(FileTestCase):
         self.assertIsNone(self.window.worker)
         self.assertEqual([record.path for record in self.window.empty_folders], [folder])
         self.assertEqual(self.window.groups, duplicate_groups)
-        self.assertTrue(self.window.empty_scan_button.isEnabled())
+        self.assertTrue(self.window.scan_button.isEnabled())
 
     def test_gui_renders_with_results(self):
         self.window.show()
