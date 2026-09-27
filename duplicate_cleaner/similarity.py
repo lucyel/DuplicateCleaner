@@ -14,7 +14,7 @@ from time import monotonic
 from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QImage, QImageReader, QPainter
 
-from .files import capture, check_location, ensure_current, open_checked
+from .files import capture, check_attributes, check_location, ensure_current, open_checked
 from .file_types import accepts_file, validate_file_types
 from .models import Cancelled, FileRecord, Issue, Progress
 from .thumbnails import _binary_pipe
@@ -251,7 +251,7 @@ def scan_similar(roots, recursive=True, *, excluded_folders=(), preset="Balanced
             if folder in exclusions or exclusions.intersection(folder.parents):
                 continue
             try:
-                check_location(folder)
+                check_location(folder, allow_cloud=True)
                 info = folder.stat()
                 if not info.st_ino:
                     raise OSError("Folder identity is unavailable")
@@ -267,9 +267,11 @@ def scan_similar(roots, recursive=True, *, excluded_folders=(), preset="Balanced
                         if path in exclusions:
                             continue
                         try:
-                            attributes = getattr(entry.stat(follow_symlinks=False), "st_file_attributes", 0)
-                            if entry.is_symlink() or attributes & 0x400:
-                                raise OSError("Link, junction, or reparse point skipped")
+                            entry_info = entry.stat(follow_symlinks=False)
+                            if entry.is_symlink():
+                                raise OSError("Symbolic link or junction skipped")
+                            check_attributes(path, getattr(entry_info, "st_file_attributes", 0),
+                                             getattr(entry_info, "st_reparse_tag", 0), allow_cloud=True)
                             if entry.is_dir(follow_symlinks=False):
                                 if recursive:
                                     stack.append(path)

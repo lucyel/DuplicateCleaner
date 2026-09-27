@@ -1,3 +1,4 @@
+import errno
 import os
 import stat
 from contextlib import contextmanager, ExitStack
@@ -11,19 +12,49 @@ class UnsafeFile(OSError):
     pass
 
 
-def check_location(path: Path) -> None:
-    # Check ancestors too: a selected folder can itself be inside a junction.
-    for part in (path, *path.parents):
-        info = part.lstat()
-        attributes = getattr(info, "st_file_attributes", 0)
-        if stat.S_ISLNK(info.st_mode) or attributes & 0x400:
-            raise UnsafeFile(f"Link, junction, or reparse point skipped: {part}")
-        if attributes & (0x1000 | 0x40000 | 0x400000):
-            raise UnsafeFile(f"Offline or cloud-only file skipped: {part}")
+def check_attributes(path: Path, attributes: int, tag: int, *, allow_cloud: bool = False) -> None:
+    if attributes & 0x400:
+        if tag & 0x20000000:  # Name-surrogate tags redirect to another location.
+            raise UnsafeFile(f"Symbolic link or junction skipped: {path}")
+        # Windows defines CLOUD and CLOUD_1 through CLOUD_F. No other tags qualify.
+        if tag & ~0xF000 != 0x9000001A:
+            raise UnsafeFile(f"Unsupported reparse point skipped (tag 0x{tag:08X}): {path}")
+        if not allow_cloud:
+            raise UnsafeFile(f"Cloud folder excluded from empty-folder cleanup: {path}")
+    if attributes & (0x1000 | 0x40000 | 0x400000):
+        raise UnsafeFile(f"Cloud or offline file not fully available locally; download it before scanning: {path}")
+
+
+def _path_attributes(path: Path) -> tuple[int, int]:
+    if os.name == "nt" and path.parent != path:
+        import pywintypes
+        import win32file
+
+        # stat() and handle queries can hide cloud tags. Directory enumeration
+        # preserves both the tag and RECALL_ON_OPEN, without opening file data.
+        try:
+            entries = win32file.FindFilesW(str(path))
+        except pywintypes.error as exc:
+            raise OSError(str(exc)) from exc
+        if not entries:
+            raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), str(path))
+        if len(entries) != 1:
+            raise UnsafeFile(f"Could not determine file attributes: {path}")
+        return entries[0][0], entries[0][6]
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode):
+        return 0x400, 0xA000000C
+    return getattr(info, "st_file_attributes", 0), getattr(info, "st_reparse_tag", 0)
+
+
+def check_location(path: Path, *, allow_cloud: bool = False) -> None:
+    # Validate ancestors first, before querying entries inside a redirected path.
+    for part in reversed((path, *path.parents)):
+        check_attributes(part, *_path_attributes(part), allow_cloud=allow_cloud)
 
 
 def capture(path: Path) -> FileRecord:
-    check_location(path)
+    check_location(path, allow_cloud=True)
     info = path.stat(follow_symlinks=False)
     if not stat.S_ISREG(info.st_mode):
         raise UnsafeFile("Not a regular file")
@@ -69,7 +100,10 @@ def _open_read(path: Path | str, allow_delete: bool) -> BinaryIO:
         try:
             handle = win32file.CreateFile(
                 str(path), win32con.GENERIC_READ, share, None,
-                win32con.OPEN_EXISTING, win32con.FILE_FLAG_SEQUENTIAL_SCAN, None,
+                win32con.OPEN_EXISTING,
+                win32con.FILE_FLAG_SEQUENTIAL_SCAN | win32file.FILE_FLAG_OPEN_REPARSE_POINT
+                | 0x00100000,  # FILE_FLAG_OPEN_NO_RECALL: do not request remote data.
+                None,
             )
         except pywintypes.error as exc:
             raise OSError(str(exc)) from exc

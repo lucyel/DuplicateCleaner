@@ -372,16 +372,16 @@ class ResultControlTests(FileTestCase):
         self.assertEqual(self.window.selected, selected)
 
     def test_filters_work_with_type_tabs_and_selected_tab(self):
+        tabs = {self.window.type_tabs.tabText(index): index for index in range(self.window.type_tabs.count())}
         self.window.filename_filter.setText("cat-copy")
         self.window.apply_filter_button.click()
-        self.window.type_tabs.setCurrentIndex(3)  # Images
-        self.assertEqual(self.window.type_tabs.tabText(3), "Images")
+        self.window.type_tabs.setCurrentIndex(tabs["Images"])
         self.assertEqual(self.window.visible_paths, {self.cat})
         self.assertEqual(self.window.summary.text(), "1 duplicate group  ·  1.00 KiB potentially recoverable")
         parent, gallery = self.show_gallery()
         copy_index = next(i for i, record in enumerate(gallery.files) if record.path == self.cat_copy)
         gallery.item(copy_index).setCheckState(Qt.CheckState.Checked)
-        self.window.type_tabs.setCurrentIndex(1)  # Selected includes all copies.
+        self.window.type_tabs.setCurrentIndex(tabs["Selected"])
         self.assertEqual(self.window.visible_paths, {self.cat, self.cat_copy})
         self.window.clear_selection()
         self.assertEqual(self.visible_groups(), [])

@@ -7,7 +7,7 @@ from threading import Event
 from time import monotonic
 from typing import BinaryIO, Callable, Iterable
 
-from .files import capture, check_location, ensure_current, open_checked, open_named_streams, UnsafeFile
+from .files import capture, check_attributes, check_location, ensure_current, open_checked, open_named_streams, UnsafeFile
 from .file_types import accepts_file, validate_file_types
 from .matching import candidate_key, compatible
 from .models import Cancelled, DuplicateGroup, FileRecord, Issue, Progress, ScanResult, SearchCriteria
@@ -158,7 +158,7 @@ def scan(roots: Iterable[Path | str], recursive: bool = True, *,
             if folder in exclusions or exclusions.intersection(folder.parents):
                 continue
             try:
-                check_location(folder)
+                check_location(folder, allow_cloud=True)
                 info = folder.stat()
                 if not info.st_ino:
                     raise UnsafeFile("The filesystem did not provide a reliable folder identity")
@@ -176,8 +176,10 @@ def scan(roots: Iterable[Path | str], recursive: bool = True, *,
                         try:
                             entry_info = entry.stat(follow_symlinks=False)
                             attributes = getattr(entry_info, "st_file_attributes", 0)
-                            if entry.is_symlink() or attributes & 0x400:
-                                raise UnsafeFile("Link, junction, or reparse point skipped")
+                            if entry.is_symlink():
+                                raise UnsafeFile("Symbolic link or junction skipped")
+                            check_attributes(path, attributes, getattr(entry_info, "st_reparse_tag", 0),
+                                             allow_cloud=True)
                             if entry.is_dir(follow_symlinks=False):
                                 if recursive:
                                     stack.append(path)

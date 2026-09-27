@@ -328,7 +328,37 @@ class GuiTests(FileTestCase):
         self.assertEqual(len(self.visible_file_items()), len(self.window.records))
         self.assertTrue(self.window.filter_hint.isHidden())
 
-    def test_selected_tab_shows_complete_affected_groups_and_updates_immediately(self):
+    def test_checking_files_keeps_group_order_for_every_sort_column(self):
+        for group in range(4):
+            for copy in range(2):
+                self.file(f"sort-{group}/copy-{copy}.txt", bytes([group]) * 100)
+        self.window.on_scan(scan([self.root]))
+        tree = self.window.tree
+
+        def order():
+            self.app.processEvents()
+            return [tree.topLevelItem(i).text(0) for i in range(tree.topLevelItemCount())]
+
+        for column in range(4):
+            for direction in (Qt.SortOrder.AscendingOrder, Qt.SortOrder.DescendingOrder):
+                with self.subTest(column=column, direction=direction):
+                    tree.sortByColumn(column, direction)
+                    expected = order()
+                    parent = tree.topLevelItem(2)
+                    child = parent.child(0)
+                    tree.setCurrentItem(child)
+                    child.setCheckState(0, Qt.CheckState.Checked)
+                    self.assertEqual(order(), expected)
+                    self.assertIs(tree.currentItem(), child)
+                    path = child.data(0, Qt.ItemDataRole.UserRole).path
+                    self.window.preview_selection_changed(path, False)
+                    self.assertEqual(order(), expected)
+                    self.window.select_folder_duplicates(child)
+                    self.assertEqual(order(), expected)
+                    self.window.clear_selection()
+                    self.assertEqual(order(), expected)
+
+    def test_selected_tab_shows_complete_groups_and_updates_immediately(self):
         pair_a = self.file("pair-a.zip", b"second duplicate group")
         self.file("pair-b.pdf", b"second duplicate group")
         self.file("untouched-a.jpg", b"untouched duplicate group")
@@ -343,6 +373,8 @@ class GuiTests(FileTestCase):
         pair_item.setCheckState(0, Qt.CheckState.Checked)
 
         self.select_tab("Selected")
+        self.assertIn("2 files selected  ·  2 groups", self.window.selection_label.text())
+        self.assertNotIn("Selected groups", [self.window.type_tabs.tabText(i) for i in range(self.window.type_tabs.count())])
         visible_parents = [self.window.tree.topLevelItem(index)
                            for index in range(self.window.tree.topLevelItemCount())
                            if not self.window.tree.topLevelItem(index).isHidden()]
@@ -398,9 +430,11 @@ class GuiTests(FileTestCase):
             item.setCheckState(0, Qt.CheckState.Checked)
         self.select_tab("Videos")
         self.assertEqual(len(self.visible_file_items()), 1)
-        self.assertEqual(group.text(1), "1 of 4 files shown")
+        self.assertIn("1 of 4 files shown", group.text(1))
+        self.assertIn("3/4 selected · 1 remaining", group.text(1))
         self.assertIn("3 hidden by this tab", self.window.selection_label.text())
         self.visible_file_items()[0].setCheckState(0, Qt.CheckState.Checked)
+        self.assertIn("4/4 selected · 0 remaining · All copies selected", group.text(1))
         selected = frozenset(self.window.selected)
         groups = tuple(self.window.groups)
 
@@ -467,24 +501,27 @@ class GuiTests(FileTestCase):
         video_item = next(item for item in self.visible_file_items()
                           if item.data(0, Qt.ItemDataRole.UserRole).path == video)
         self.window.tree.setCurrentItem(video_item)
-        QTest.mouseClick(self.window.select_folder_button, Qt.MouseButton.LeftButton)
+        with patch("duplicate_cleaner.gui.random.choice", return_value=archive):
+            QTest.mouseClick(self.window.select_folder_button, Qt.MouseButton.LeftButton)
 
         expected_folder_paths = {path for path in self.window.records if path.parent == target_folder}
         self.assertEqual(expected_folder_paths,
                          {target_folder / "meeting-notes.txt", video, archive, document})
-        self.assertEqual(self.window.selected, expected_folder_paths | {outside})
+        expected_selected = (expected_folder_paths - {archive}) | {outside}
+        self.assertEqual(self.window.selected, expected_selected)
         self.assertNotIn(nested, self.window.selected)
         for item in self.window.file_items():
             path = item.data(0, Qt.ItemDataRole.UserRole).path
             expected_state = Qt.CheckState.Checked if path in self.window.selected else Qt.CheckState.Unchecked
             self.assertEqual(item.checkState(0), expected_state)
-        self.assertIn("Selected 4 new", self.window.status.text())
-        self.assertIn("4 duplicate files selected", self.window.status.text())
-        self.assertIn("3 hidden by this tab", self.window.status.text())
-        self.assertIn("4 hidden by this tab", self.window.selection_label.text())
+        self.assertIn("Selected 3 new", self.window.status.text())
+        self.assertIn("3 duplicate files selected", self.window.status.text())
+        self.assertIn("2 hidden by this tab", self.window.status.text())
+        self.assertIn("3 hidden by this tab", self.window.selection_label.text())
+        self.assertIn("Kept one copy in 1 group(s)", self.window.status.text())
 
         QTest.mouseClick(self.window.select_folder_button, Qt.MouseButton.LeftButton)
-        self.assertEqual(self.window.selected, expected_folder_paths | {outside})
+        self.assertEqual(self.window.selected, expected_selected)
         self.assertIn("Selected 0 new", self.window.status.text())
 
         self.select_tab("Selected")
@@ -492,7 +529,89 @@ class GuiTests(FileTestCase):
                               for index in range(self.window.tree.topLevelItemCount())
                               if not self.window.tree.topLevelItem(index).isHidden()]), 2)
         self.assertEqual(len(self.visible_file_items()), 6)
-        self.assertIn("2 duplicate groups containing 5 checked files", self.window.filter_hint.text())
+        self.assertIn("2 duplicate groups containing 4 checked files", self.window.filter_hint.text())
+
+    def test_folder_selection_keeps_one_of_many_and_repeated_clicks_keep_the_same_copy(self):
+        for count in (2, 3, 5):
+            for index in range(count):
+                self.file(f"Copies{count}/copy-{index}.txt", f"group of {count}".encode())
+        self.window.on_scan(scan([self.root]))
+        original_group = next(group for group in self.window.groups if len(group.files) == 3
+                              and group.files[0].path.parent.name != "Copies3")
+        self.window.preview_selection_changed(original_group.files[0].path, True)
+        for count in (2, 3, 5):
+            paths = {path for path in self.window.records if path.parent.name == f"Copies{count}"}
+            item = next(item for item in self.window.file_items()
+                        if item.data(0, Qt.ItemDataRole.UserRole).path in paths)
+            with patch("duplicate_cleaner.gui.random.choice", side_effect=lambda choices: choices[-1]) as choice:
+                self.window.select_folder_duplicates(item)
+                self.assertEqual(set(choice.call_args.args[0]), paths)
+            self.assertEqual(len(paths & self.window.selected), count - 1)
+            keeper = (paths - self.window.selected).pop()
+            selected = set(self.window.selected)
+            self.window.select_folder_duplicates(item)
+            self.assertEqual(self.window.selected, selected)
+            self.assertNotIn(keeper, self.window.selected)
+            self.assertIn(f"{count - 1}/{count} selected · 1 remaining", item.parent().text(1))
+        self.assertIn(original_group.files[0].path, self.window.selected)
+        self.assertIn("4 groups", self.window.selection_label.text())
+
+    def test_folder_selection_considers_hidden_and_previously_checked_copies(self):
+        group = self.window.groups[0]
+        target = next(record.path for record in group.files if record.path.parent.name == "Documents")
+        for record in group.files:
+            if record.path != target:
+                self.window.preview_selection_changed(record.path, True)
+        self.window.folder_path_filter.setText(str(target.parent))
+        self.window.apply_result_filters()
+        self.select_tab("Videos")
+        item = next(item for item in self.window.file_items() if item.data(0, Qt.ItemDataRole.UserRole).path == target)
+        self.assertTrue(item.isHidden())
+        selected = set(self.window.selected)
+        self.window.select_folder_duplicates(item)
+        self.assertEqual(self.window.selected, selected)
+        self.assertNotIn(target, self.window.selected)
+        # Even a group that was manually fully selected is repaired only within this folder.
+        self.window.preview_selection_changed(target, True)
+        self.window.select_folder_duplicates(item)
+        self.assertEqual(self.window.selected, selected)
+        self.assertEqual(item.checkState(0), Qt.CheckState.Unchecked)
+
+    def test_selected_view_updates_from_preview_and_keeps_global_counts_when_filtered(self):
+        first, second, third = self.window.groups[0].files
+        self.select_tab("Selected")
+        self.window.preview_selection_changed(first.path, True)
+        self.window.preview_selection_changed(second.path, True)
+        self.assertEqual(len(self.visible_file_items()), 3)
+        self.assertIn("2 files selected  ·  1 group", self.window.selection_label.text())
+        self.window.preview_selection_changed(first.path, False)
+        self.assertEqual(len(self.visible_file_items()), 3)
+        self.window.filename_filter.setText("no matching filename")
+        self.window.apply_result_filters()
+        self.assertEqual(len(self.visible_file_items()), 0)
+        self.assertIn("1 file selected  ·  1 group", self.window.selection_label.text())
+        self.assertIn("1 hidden", self.window.selection_label.text())
+        self.window.clear_result_filters()
+        self.window.preview_selection_changed(second.path, False)
+        self.assertEqual(len(self.visible_file_items()), 0)
+        self.assertIn("0 files selected  ·  0 groups", self.window.selection_label.text())
+
+    def test_legacy_selected_groups_session_maps_to_selected_or_all_without_checks(self):
+        selected = {self.window.groups[0].files[0].path}
+        data = self.saved_session_data(selected, "Selected groups")
+        result = LoadResult(self.root / "work.dupsession", data, saved_selection_count=1)
+        for restore in (True, False):
+            def accept(dialog):
+                button = next(button for button in dialog.buttons() if button.text().startswith("Restore")) \
+                    if restore else dialog.defaultButton()
+                button.click()
+                return 0
+            with patch.object(QMessageBox, "exec", accept):
+                self.window.on_session_loaded(result)
+            self.assertEqual(self.window.type_tabs.tabText(self.window.type_tabs.currentIndex()),
+                             "Selected" if restore else "All")
+            self.assertEqual(self.window.selected, selected if restore else set())
+            self.assertEqual(len(self.visible_file_items()), 3)
 
     def test_folder_selection_controls_follow_the_target_file(self):
         self.assertFalse(self.window.select_folder_button.isEnabled())
@@ -515,7 +634,7 @@ class GuiTests(FileTestCase):
             callback = fake_action.triggered.connect.call_args.args[0]
             callback()
         self.assertEqual([call.args[0] for call in fake_menu.addAction.call_args_list],
-                         ["Open file location", "Select all duplicates in this folder"])
+                         ["Open file location", "Select this folder's duplicates (keep one copy)"])
         fake_action.setEnabled.assert_called_once_with(True)
         fake_menu.exec.assert_called_once()
         select.assert_called_once_with(item)

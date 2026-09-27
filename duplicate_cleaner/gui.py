@@ -1,4 +1,5 @@
 import os
+import random
 import re
 import shlex
 from datetime import datetime
@@ -211,8 +212,12 @@ class Worker(QThread):
 
 
 class ResultItem(QTreeWidgetItem):
+    group_sort_keys = None
+
     def __lt__(self, other):
         column = self.treeWidget().sortColumn()
+        if self.group_sort_keys is not None and other.group_sort_keys is not None:
+            return self.group_sort_keys[column] < other.group_sort_keys[column]
         if column == 2:
             return self.data(2, Qt.ItemDataRole.UserRole) < other.data(2, Qt.ItemDataRole.UserRole)
         return self.text(column).casefold() < other.text(column).casefold()
@@ -671,7 +676,8 @@ class MainWindow(QMainWindow):
         foot.addWidget(self.clear_button)
         self.select_folder_button = QPushButton("Select this folder's duplicates")
         self.select_folder_button.setToolTip(
-            "Check every listed match in the highlighted file's exact folder, including files in other tabs.")
+            "Select matches in this exact folder, including hidden files. Leave one random copy unchecked "
+            "if a group would otherwise have every copy selected; repeated clicks keep that copy.")
         self.select_folder_button.clicked.connect(lambda: self.select_folder_duplicates())
         foot.addWidget(self.select_folder_button)
         self.issue_button = QPushButton("Skipped files / errors (0)")
@@ -959,7 +965,10 @@ class MainWindow(QMainWindow):
         noun = "file" if len(self.selected) == 1 else "files"
         hidden = len(self.selected - self.visible_paths)
         suffix = f"  ·  {hidden:,} hidden by this tab or filters" if hidden else ""
-        self.selection_label.setText(f"{len(self.selected):,} {noun} selected  ·  {format_bytes(amount)}{suffix}")
+        affected = sum(any(record.path in self.selected for record in group.files) for group in self.groups)
+        group_noun = "group" if affected == 1 else "groups"
+        self.selection_label.setText(
+            f"{len(self.selected):,} {noun} selected  ·  {affected:,} {group_noun}  ·  {format_bytes(amount)}{suffix}")
         folder_noun = "folder" if len(self.selected_empty_folders) == 1 else "folders"
         self.empty_folder_selection_label.setText(
             f"{len(self.selected_empty_folders):,} {folder_noun} selected for recycling")
@@ -1035,8 +1044,6 @@ class MainWindow(QMainWindow):
         visible_savings = 0
         possible = False
         self.tree.setUpdatesEnabled(False)
-        sorting = self.tree.isSortingEnabled()
-        labels = []
         try:
             for index in range(self.tree.topLevelItemCount()):
                 parent = self.tree.topLevelItem(index)
@@ -1060,23 +1067,12 @@ class MainWindow(QMainWindow):
                     visible_groups += 1
                     visible_savings += group.extra_bytes
                     possible = possible or not group.contents_verified
-                label = ("" if visible == parent.childCount() else
-                         f"{visible} of {parent.childCount()} files shown")
-                if parent.text(1) != label:
-                    labels.append((parent, label))
-            # Defer sort-key changes until traversal ends; unchanged labels need no resort.
-            if labels:
-                self.tree.setSortingEnabled(False)
-                for parent, label in labels:
-                    parent.setText(1, label)
             current = self.tree.currentItem()
             if current is not None and (current.isHidden() or
                                        (current.parent() is not None and current.parent().isHidden())):
                 self.tree.setCurrentItem(None)
                 self.tree.clearSelection()
         finally:
-            if labels:
-                self.tree.setSortingEnabled(sorting)
             self.tree.setUpdatesEnabled(True)
         if self.summary_notice is not None:
             self.summary.setText(self.summary_notice)
@@ -1099,7 +1095,7 @@ class MainWindow(QMainWindow):
                 f"{visible_groups:,} duplicate {noun} containing {len(self.selected):,} checked {checked}. "
                 "Unchecked copies are shown so you can see what will remain.")
         elif selected_view:
-            self.filter_hint.setText("No files are checked. Choose files in any tab to show their complete duplicate groups here.")
+            self.filter_hint.setText("No files are checked. Choose files in any tab to show them here.")
         elif self.visible_paths:
             self.filter_hint.setText(f"{len(self.visible_paths):,} of {len(self.records):,} duplicate files shown by extension. "
                                      "Group totals and savings include copies in other tabs.")
@@ -1124,6 +1120,7 @@ class MainWindow(QMainWindow):
         all_highlight = QBrush(QColor("#53252d" if dark else "#fee2e2"))
         checked_icon = control_icon("checked", dark)
         all_icon = control_icon("all_checked", dark, "#f87171" if dark else "#b91c1c")
+        labels = []
         for index in range(self.tree.topLevelItemCount()):
             parent = self.tree.topLevelItem(index)
             group = parent.data(0, Qt.ItemDataRole.UserRole)
@@ -1139,6 +1136,24 @@ class MainWindow(QMainWindow):
             parent.setData(0, Qt.ItemDataRole.AccessibleDescriptionRole, description)
             parent.setToolTip(0, f"{group.metadata_status}\nScan SHA-256: {group.digest or 'Not calculated'}"
                              + (f"\n{description}" if checked else ""))
+            visible = sum(not parent.child(index).isHidden() for index in range(parent.childCount()))
+            parts = [f"{visible} of {len(group.files)} files shown"] if visible != len(group.files) else []
+            if checked:
+                parts.append(f"{checked}/{len(group.files)} selected · {len(group.files) - checked} remaining")
+                if all_checked:
+                    parts.append("All copies selected")
+            label = " · ".join(parts)
+            if parent.text(1) != label:
+                labels.append((parent, label))
+        # Batch label updates; group ordering uses immutable scan-time keys, not these labels.
+        if labels:
+            sorting = self.tree.isSortingEnabled()
+            self.tree.setSortingEnabled(False)
+            try:
+                for parent, label in labels:
+                    parent.setText(1, label)
+            finally:
+                self.tree.setSortingEnabled(sorting)
 
     def start_job(self, job, handler, error_handler=None):
         self.thumbnails.clear()
@@ -1328,6 +1343,8 @@ class MainWindow(QMainWindow):
             finally:
                 self._changing_checks = False
         tab_name = data.active_tab
+        if tab_name == "Selected groups":
+            tab_name = "Selected"
         if tab_name == "Selected" and not restore_checks:
             tab_name = "All"
         tab_index = next((index for index in range(self.type_tabs.count())
@@ -1363,6 +1380,11 @@ class MainWindow(QMainWindow):
                 parent = ResultItem(self.tree, [
                     f"Group {number} · {group.metadata_status} · {len(group.files)} files", "", "", "",
                 ])
+                # Status text changes when checking files. Keep it out of sorting, and break
+                # equal-key ties by the scan's group number so selection cannot reshuffle rows.
+                parent.group_sort_keys = tuple((value, number) for value in (
+                    parent.text(0).casefold(), min(str(record.path).casefold() for record in group.files),
+                    group.extra_bytes, ""))
                 parent.setData(2, Qt.ItemDataRole.UserRole, group.extra_bytes)
                 parent.setData(0, Qt.ItemDataRole.UserRole, group)
                 parent.setToolTip(0, f"{group.metadata_status}\nScan SHA-256: {group.digest or 'Not calculated'}")
@@ -1429,18 +1451,34 @@ class MainWindow(QMainWindow):
             if child_folder == folder_key:
                 matches.append(child)
         paths = {child.data(0, Qt.ItemDataRole.UserRole).path for child in matches}
-        newly_selected = len(paths - self.selected)
+        selected = self.selected | paths
+        kept = set()
+        for group in self.groups:
+            group_paths = {record.path for record in group.files}
+            in_folder = group_paths & paths
+            if in_folder and group_paths <= selected:
+                # Prefer an unchecked copy in the target folder. A repeat click then preserves
+                # the sole remaining copy without changing manual selections in other folders.
+                candidates = in_folder - self.selected or in_folder
+                keeper = random.choice(sorted(candidates))
+                selected.remove(keeper)
+                kept.add(keeper)
+        newly_selected = len(selected - self.selected)
+        paths &= selected
         self._changing_checks = True
         try:
+            self.selected = selected
             for child in matches:
-                child.setCheckState(0, Qt.CheckState.Checked)
-            self.selected.update(paths)
+                path = child.data(0, Qt.ItemDataRole.UserRole).path
+                child.setCheckState(0, Qt.CheckState.Checked if path in selected else Qt.CheckState.Unchecked)
         finally:
             self._changing_checks = False
         self.refresh_selection_view()
         hidden = len(paths - self.visible_paths)
         noun = "file" if len(paths) == 1 else "files"
         message = (f"Selected {newly_selected:,} new · {len(paths):,} duplicate {noun} selected in {folder}")
+        if kept:
+            message += f" · Kept one copy in {len(kept):,} group(s)"
         if hidden:
             message += f" · {hidden:,} hidden by this tab"
         self.status.setText(message)
@@ -1454,7 +1492,7 @@ class MainWindow(QMainWindow):
         open_location = menu.addAction("Open file location")
         open_location.triggered.connect(self.open_folder)
         menu.addSeparator()
-        select_folder = menu.addAction("Select all duplicates in this folder")
+        select_folder = menu.addAction("Select this folder's duplicates (keep one copy)")
         select_folder.setEnabled(self.worker is None)
         select_folder.triggered.connect(lambda: self.select_folder_duplicates(item))
         menu.exec(self.tree.viewport().mapToGlobal(position))
