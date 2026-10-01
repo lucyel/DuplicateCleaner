@@ -101,7 +101,7 @@ class ScannerTests(FileTestCase):
         self.assertEqual(result.file_count, 1)
         self.assertFalse(result.groups)
 
-    def test_discovery_releases_unique_records_before_content_checks(self):
+    def test_discovery_retains_unmatched_records_without_hashing_them(self):
         from duplicate_cleaner import scanner
 
         for size in range(1, 11):
@@ -118,14 +118,16 @@ class ScannerTests(FileTestCase):
 
         def check_memory(progress):
             if progress.stage == "Comparing samples":
-                # The discovery loop may still hold its final local record.
-                self.assertLessEqual(sum(ref() is not None for ref in unique_records), 1)
+                self.assertEqual(sum(ref() is not None for ref in unique_records), 10)
 
         with patch.object(scanner, "capture", side_effect=remember):
             result = scan([self.root], progress=check_memory)
         self.assertEqual(result.file_count, 12)
         self.assertEqual(len(result.groups), 1)
         self.assertFalse(result.issues)
+        self.assertEqual(len(result.index), 12)
+        self.assertTrue(all(item.sample is None and item.digest is None
+                            for item in result.index.values() if item.record.size <= 10))
 
     def test_renamed_duplicates_across_folders_and_distinct_same_size(self):
         first = self.file("one/a.txt", b"hello")

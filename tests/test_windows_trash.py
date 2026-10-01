@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from duplicate_cleaner.cleanup import recycle_selected
 from duplicate_cleaner.empty_folders import recycle_empty_folders, scan_empty_folders
+from duplicate_cleaner.duplicate_folders import recycle_duplicate_folders, scan_duplicate_folders
 from duplicate_cleaner.scanner import scan
 from duplicate_cleaner.windows_trash import recycle_file
 from tests.support import FileTestCase
@@ -13,6 +14,34 @@ from tests.support import FileTestCase
 @unittest.skipUnless(os.name == "nt" and os.environ.get("DUPLICATE_CLEANER_RECYCLE_TEST") == "1",
                      "Set DUPLICATE_CLEANER_RECYCLE_TEST=1 for real Windows Shell tests on disposable files")
 class WindowsRecycleTests(FileTestCase):
+    def test_real_cleanup_recycles_nonempty_folder_and_preserves_comparison(self):
+        selected = self.file("selected-folder/nested/file.txt")
+        kept = self.file("comparison-folder/renamed.txt")
+        folder = self.root / "selected-folder"
+        result = recycle_duplicate_folders(scan_duplicate_folders(
+            [folder, self.root / "comparison-folder"], False).groups, [folder])
+        self.assertFalse(result.issues, result.issues)
+        self.assertEqual(result.recycled, [folder])
+        self.assertFalse(selected.exists())
+        self.assertEqual(kept.read_bytes(), b"identical content")
+
+    def test_real_cleanup_recycles_every_folder_copy(self):
+        first = self.file("first-folder/nested/file.txt")
+        second = self.file("second-folder/renamed.txt")
+        paths = [first.parent.parent, second.parent]
+        result = recycle_duplicate_folders(scan_duplicate_folders(paths, False).groups, paths)
+        self.assertFalse(result.issues, result.issues)
+        self.assertEqual(result.recycled, paths)
+        self.assertTrue(all(not path.exists() for path in paths))
+
+    def test_folder_shell_callback_veto_preserves_complete_tree(self):
+        path = self.file("callback-veto-folder/contents.txt")
+        def veto():
+            raise OSError("Folder callback veto")
+        with self.assertRaisesRegex(OSError, "Folder callback veto"):
+            recycle_file(path.parent, veto)
+        self.assertEqual(path.read_bytes(), b"identical content")
+
     def test_real_cleanup_recycles_when_keeper_has_additional_dropbox_stream(self):
         selected = self.file("selected-disposable.jpg")
         kept = self.file("keeper-with-dropbox-metadata.jpg")

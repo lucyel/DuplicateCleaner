@@ -4,6 +4,7 @@ import re
 import shlex
 from datetime import datetime
 from decimal import Decimal
+from dataclasses import replace
 from pathlib import Path
 from threading import Event
 
@@ -19,12 +20,14 @@ from PySide6.QtWidgets import (
 )
 
 from .cleanup import recycle_selected
-from .empty_folders import (EmptyFolderRecord, EmptyFolderRecycleResult, EmptyFolderScanResult,
-                            ensure_empty_folder_current, recycle_empty_folders)
+from .duplicate_folders import (FolderRecord, FolderGroup, FolderScanResult,
+                                ensure_folder_current, recycle_duplicate_folders)
+from .scanner import Reporter
+from .scan_control import ScanControl
 from .files import ensure_current
 from .file_types import FILE_TYPES, file_type
 from .scan_workflow import SCAN_MODES, run_selected_scans
-from .similarity import PRESETS
+from .similarity import PRESETS, SimilarResult
 from .models import DuplicateGroup, FileRecord, Progress, RecycleResult, ScanResult, SearchCriteria, format_bytes
 from .preview import ComparisonPreview
 from .similar_tab import SimilarTab
@@ -197,15 +200,21 @@ class Worker(QThread):
     progress = Signal(object)
     outcome = Signal(object)
     failed = Signal(str)
+    mode_started = Signal(str)
+    mode_finished = Signal(str, object, str)
+    paused = Signal()
 
-    def __init__(self, job, parent=None):
+    def __init__(self, job, parent=None, *, scan_run=False):
         super().__init__(parent)
         self.job = job
-        self.cancel_event = Event()
+        self.cancel_event = ScanControl(self.paused.emit) if scan_run else Event()
+        self.scan_run = scan_run
 
     def run(self):
         try:
-            result = self.job(cancel=self.cancel_event, progress=self.progress.emit)
+            callbacks = (dict(on_mode_started=self.mode_started.emit, on_mode_finished=self.mode_finished.emit)
+                         if self.scan_run else {})
+            result = self.job(cancel=self.cancel_event, progress=self.progress.emit, **callbacks)
             self.outcome.emit(result)
         except Exception as exc:
             self.failed.emit(f"{type(exc).__name__}: {exc}")
@@ -266,6 +275,20 @@ class MainWindow(QMainWindow):
         self.resize(1220, 800)
         self.setMinimumSize(940, 720)
         self.worker = None
+        self.scan_worker = None
+        self.scan_mode_states = {}
+        self._scan_modes_running = ()
+        self._scan_messages = {}
+        self._last_scan_progress = None
+        self._scan_paused = False
+        self._restart_scan = False
+        self._scan_settings = None
+        self._scan_baselines = {}
+        self._baseline_settings = None
+        self._incremental_run = False
+        self._incremental_states = {}
+        self._scan_recycled = []
+        self._scan_cache_valid = True
         self.groups: list[DuplicateGroup] = []
         self.selected: set[Path] = set()
         self.visible_paths: set[Path] = set()
@@ -279,9 +302,10 @@ class MainWindow(QMainWindow):
         self.session_path: Path | None = None
         self.scan_file_count = 0
         self.scan_total_bytes = 0
-        self.empty_folders: list[EmptyFolderRecord] = []
-        self.selected_empty_folders: set[Path] = set()
-        self.empty_folder_issues = []
+        self.folder_groups: list[FolderGroup] = []
+        self.duplicate_folders: list[FolderRecord] = []
+        self.selected_duplicate_folders: set[Path] = set()
+        self.duplicate_folder_issues = []
         self._changing_empty_checks = False
 
         container = QWidget()
@@ -362,6 +386,11 @@ class MainWindow(QMainWindow):
         self.scan_button.setToolTip("Scanning never changes files. Links and unsafe files are skipped.")
         self.scan_button.setObjectName("primary")
         self.scan_button.clicked.connect(self.start_scan)
+        self.scan_added_button = QPushButton("Scan added folders")
+        self.scan_added_button.clicked.connect(self.start_added_scan)
+        self.pause_button = QPushButton("Pause scan")
+        self.pause_button.clicked.connect(self.toggle_scan_pause)
+        self.pause_button.setToolTip("Pause to add disks or change criteria. Changed settings restart the scan on Resume.")
         self.save_session_button = QPushButton("Save session…")
         self.save_session_button.setToolTip("Save these results and checked files so you can continue later.")
         self.save_session_button.clicked.connect(self.save_session)
@@ -418,7 +447,7 @@ class MainWindow(QMainWindow):
             checkbox.toggled.connect(self.file_types_changed)
             self.file_type_checks[name] = checkbox
             types_layout.addWidget(checkbox, 1 + index // 3, index % 3)
-        type_help = QLabel("Types are selected by file extension. Empty-folder scans always inspect every entry.\n"
+        type_help = QLabel("Types are selected by file extension. Duplicate-folder scans always inspect every entry.\n"
                            "Similarity supports decodable images and videos only; other chosen types are skipped.")
         type_help.setWordWrap(True)
         types_layout.addWidget(type_help, 3, 0, 1, 3)
@@ -695,54 +724,54 @@ class MainWindow(QMainWindow):
         self.selection_label.setWordWrap(True)
         content.addWidget(self.selection_label)
 
-        empty_page = QWidget()
-        empty_content = QVBoxLayout(empty_page)
+        folder_page = QWidget()
+        empty_content = QVBoxLayout(folder_page)
         empty_content.setContentsMargins(12, 12, 12, 12)
         empty_content.setSpacing(12)
-        self.empty_folder_summary = QLabel("Ready to check for empty folders")
-        self.empty_folder_summary.setObjectName("summary")
-        self.empty_folder_summary.setWordWrap(True)
-        empty_content.addWidget(self.empty_folder_summary)
+        self.duplicate_folder_summary = QLabel("Ready to compare folders")
+        self.duplicate_folder_summary.setObjectName("summary")
+        self.duplicate_folder_summary.setWordWrap(True)
+        empty_content.addWidget(self.duplicate_folder_summary)
         empty_heading = QHBoxLayout()
-        empty_section = QLabel("Review empty folders")
+        empty_section = QLabel("Review duplicate and empty folders")
         empty_section.setObjectName("section")
         empty_heading.addWidget(empty_section)
         empty_heading.addStretch()
         empty_content.addLayout(empty_heading)
-        self.empty_folder_hint = QLabel(
-            "Only truly empty folders are listed. Selected scan roots, links, and junctions are excluded.\n"
+        self.duplicate_folder_hint = QLabel(
+            "Folders match by file count and contents, including subfolders; names can differ.\n"
             "Every checkbox starts unchecked. Double-click a row to open the folder.")
-        self.empty_folder_hint.setObjectName("hint")
-        self.empty_folder_hint.setWordWrap(True)
-        empty_content.addWidget(self.empty_folder_hint)
-        self.empty_folder_tree = ResultTree()
-        self.empty_folder_tree.setHeaderLabels(["Folder", "Full path", "Modified"])
-        self.empty_folder_tree.setRootIsDecorated(False)
-        self.empty_folder_tree.setAlternatingRowColors(True)
-        self.empty_folder_tree.setUniformRowHeights(True)
-        self.empty_folder_tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.empty_folder_tree.setSortingEnabled(True)
-        self.empty_folder_tree.sortByColumn(1, Qt.SortOrder.AscendingOrder)
-        self.empty_folder_tree.header().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        self.empty_folder_tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.empty_folder_tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self.empty_folder_tree.setColumnWidth(0, 170)
-        self.empty_folder_tree.itemChanged.connect(self.empty_folder_item_changed)
-        self.empty_folder_tree.itemDoubleClicked.connect(self.open_empty_folder)
-        empty_content.addWidget(self.empty_folder_tree, 1)
+        self.duplicate_folder_hint.setObjectName("hint")
+        self.duplicate_folder_hint.setWordWrap(True)
+        empty_content.addWidget(self.duplicate_folder_hint)
+        self.duplicate_folder_tree = ResultTree()
+        self.duplicate_folder_tree.setHeaderLabels(["Folder / group", "Full path", "Size", "Files"])
+        self.duplicate_folder_tree.setRootIsDecorated(True)
+        self.duplicate_folder_tree.setAlternatingRowColors(True)
+        self.duplicate_folder_tree.setUniformRowHeights(True)
+        self.duplicate_folder_tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.duplicate_folder_tree.setSortingEnabled(True)
+        self.duplicate_folder_tree.sortByColumn(1, Qt.SortOrder.AscendingOrder)
+        self.duplicate_folder_tree.header().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.duplicate_folder_tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.duplicate_folder_tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.duplicate_folder_tree.setColumnWidth(0, 170)
+        self.duplicate_folder_tree.itemChanged.connect(self.duplicate_folder_item_changed)
+        self.duplicate_folder_tree.itemDoubleClicked.connect(self.open_duplicate_folder)
+        empty_content.addWidget(self.duplicate_folder_tree, 1)
         empty_foot = QHBoxLayout()
-        self.clear_empty_folders_button = QPushButton("Clear folder selection")
-        self.clear_empty_folders_button.clicked.connect(self.clear_empty_folder_selection)
-        empty_foot.addWidget(self.clear_empty_folders_button)
-        self.empty_folder_issue_button = QPushButton("Skipped folders / errors (0)")
-        self.empty_folder_issue_button.clicked.connect(self.show_empty_folder_issues)
-        empty_foot.addWidget(self.empty_folder_issue_button)
+        self.clear_duplicate_folders_button = QPushButton("Clear folder selection")
+        self.clear_duplicate_folders_button.clicked.connect(self.clear_duplicate_folder_selection)
+        empty_foot.addWidget(self.clear_duplicate_folders_button)
+        self.duplicate_folder_issue_button = QPushButton("Skipped folders / errors (0)")
+        self.duplicate_folder_issue_button.clicked.connect(self.show_duplicate_folder_issues)
+        empty_foot.addWidget(self.duplicate_folder_issue_button)
         empty_foot.addStretch()
         empty_content.addLayout(empty_foot)
-        self.empty_folder_selection_label = QLabel("0 folders selected for recycling")
-        self.empty_folder_selection_label.setObjectName("section")
-        self.empty_folder_selection_label.setWordWrap(True)
-        empty_content.addWidget(self.empty_folder_selection_label)
+        self.duplicate_folder_selection_label = QLabel("0 folders selected for recycling")
+        self.duplicate_folder_selection_label.setObjectName("section")
+        self.duplicate_folder_selection_label.setWordWrap(True)
+        empty_content.addWidget(self.duplicate_folder_selection_label)
         empty_action = QHBoxLayout()
         empty_recycle_hint = QLabel(
             "Folders are checked again before being sent to the Recycle Bin.\n"
@@ -750,21 +779,23 @@ class MainWindow(QMainWindow):
         empty_recycle_hint.setObjectName("hint")
         empty_recycle_hint.setWordWrap(True)
         empty_action.addWidget(empty_recycle_hint, 1)
-        self.recycle_empty_folders_button = QPushButton("Recycle selected folders")
-        self.recycle_empty_folders_button.setObjectName("primary")
-        self.recycle_empty_folders_button.clicked.connect(self.confirm_empty_folder_recycle)
-        empty_action.addWidget(self.recycle_empty_folders_button)
+        self.recycle_duplicate_folders_button = QPushButton("Recycle selected folders")
+        self.recycle_duplicate_folders_button.setObjectName("primary")
+        self.recycle_duplicate_folders_button.clicked.connect(self.confirm_duplicate_folder_recycle)
+        empty_action.addWidget(self.recycle_duplicate_folders_button)
         empty_content.addLayout(empty_action)
-        self.empty_page = empty_page
+        self.folder_page = folder_page
         self.similar_tab = SimilarTab()
         self.workflow_tabs.addTab(self.location_page, "Scan location")
         self.workflow_tabs.addTab(self.criteria_scroll, "Search criteria")
         self.workflow_tabs.addTab(self.duplicate_page, "Duplicate files")
+        self.workflow_tabs.addTab(self.folder_page, "Duplicate folders")
         self.workflow_tabs.addTab(self.similar_tab, "Similar files")
-        self.workflow_tabs.addTab(self.empty_page, "Empty folders")
 
         scan_actions = QHBoxLayout()
         scan_actions.addWidget(self.scan_button)
+        scan_actions.addWidget(self.scan_added_button)
+        scan_actions.addWidget(self.pause_button)
         scan_actions.addStretch()
         scan_actions.addWidget(self.save_session_button)
         scan_actions.addWidget(self.load_session_button)
@@ -879,7 +910,7 @@ class MainWindow(QMainWindow):
                    for index in range(self.folders.count()))
 
     def choose_excluded_folder(self):
-        if self.worker is not None or not self.folders.count():
+        if self.worker is not None or (self.scan_worker is not None and not self._scan_paused) or not self.folders.count():
             return
         root = self.folders.currentItem() or self.folders.item(0)
         folder = QFileDialog.getExistingDirectory(self, "Choose a subfolder to exclude", root.text())
@@ -906,17 +937,24 @@ class MainWindow(QMainWindow):
             self.excluded_folders.takeItem(self.excluded_folders.row(item))
         self.update_actions()
 
+    def mode_busy(self, mode):
+        return self.worker is not None or (self.scan_worker is not None
+            and (self._incremental_run or self.scan_mode_states.get(mode) in ("Waiting", "Scanning")))
+
     def update_actions(self):
-        busy = self.worker is not None
+        busy = self.worker is not None or self.scan_worker is not None
+        settings_locked = self.worker is not None or (self.scan_worker is not None and not self._scan_paused)
+        duplicates_busy = self.mode_busy("duplicates")
+        folders_busy = self.mode_busy("folders")
         criteria = self.search_criteria()
         modes = self.selected_modes()
-        file_modes = any(mode != "empty" for mode in modes)
+        file_modes = any(mode != "folders" for mode in modes)
         self.file_types_box.setEnabled(file_modes)
         self.similarity_options.setEnabled("similarity" in modes)
         for box in self.duplicate_criteria_boxes:
             box.setEnabled("duplicates" in modes)
-        self.similar_tab.set_busy(busy)
-        self.criteria_page.setEnabled(not busy)
+        self.similar_tab.set_busy(self.mode_busy("similarity"))
+        self.criteria_page.setEnabled(not settings_locked)
         for key, enabled in (
                 ("ignore_copy", criteria.filename or criteria.similar_names),
                 ("created_date_only", criteria.created), ("modified_date_only", criteria.modified),
@@ -935,32 +973,41 @@ class MainWindow(QMainWindow):
             "Hashes match, but bytes are not compared during scanning. Recycling still verifies contents." if criteria.hashes else
             "Results are possible matches only. Contents must still match before recycling.")
         for widget in (self.add_button, self.remove_button, self.recursive, self.folders,
-                       self.excluded_folders, self.tree, self.type_tabs, self.filter_panel,
-                       self.comparison_preview, self.empty_folder_tree):
-            widget.setEnabled(not busy)
-        self.exclude_button.setEnabled(not busy and self.folders.count() > 0)
-        self.remove_exclusion_button.setEnabled(not busy and bool(self.excluded_folders.selectedItems()))
+                       self.excluded_folders):
+            widget.setEnabled(not settings_locked)
+        for widget in (self.tree, self.type_tabs, self.filter_panel, self.comparison_preview):
+            widget.setEnabled(not duplicates_busy)
+        self.duplicate_folder_tree.setEnabled(not folders_busy)
+        self.exclude_button.setEnabled(not settings_locked and self.folders.count() > 0)
+        self.remove_exclusion_button.setEnabled(not settings_locked and bool(self.excluded_folders.selectedItems()))
+        self.pause_button.setEnabled(self.scan_worker is not None and self.worker is None
+                                     and not self.scan_worker.cancel_event.is_set())
+        self.pause_button.setText("Resume scan" if self._scan_paused else "Pause scan")
         self.scan_button.setEnabled(not busy and self.folders.count() > 0 and bool(modes)
                                     and ("duplicates" not in modes or criteria.enabled)
                                     and (not file_modes or self.selected_file_types() != ()))
-        self.save_session_button.setEnabled(not busy and self.session_available)
+        added, reason = self.added_scan_scope()
+        self.scan_added_button.setEnabled(not busy and bool(added) and not reason)
+        self.scan_added_button.setToolTip(reason or "Scan only added locations and compare them with retained results. Old candidate copies may be read for verification.")
+        self.save_session_button.setEnabled(not duplicates_busy and self.session_available)
         self.load_session_button.setEnabled(not busy)
-        self.cancel_button.setEnabled(busy and not self.worker.cancel_event.is_set())
-        self.recycle_button.setEnabled(not busy and bool(self.selected))
-        self.clear_button.setEnabled(not busy and bool(self.selected))
+        self.cancel_button.setEnabled(any(worker is not None and not worker.cancel_event.is_set()
+                                          for worker in (self.worker, self.scan_worker)))
+        self.recycle_button.setEnabled(not duplicates_busy and bool(self.selected))
+        self.clear_button.setEnabled(not duplicates_busy and bool(self.selected))
         self.issue_button.setEnabled(bool(self.issues))
         self.issue_button.setText(f"Skipped files / errors ({len(self.issues):,})")
         current = self.tree.currentItem()
         current_is_file = current is not None and current.parent() is not None
-        self.open_button.setEnabled(not busy and current_is_file)
-        self.select_folder_button.setEnabled(not busy and current_is_file)
-        self.recycle_empty_folders_button.setEnabled(
-            not busy and bool(self.selected_empty_folders))
-        self.clear_empty_folders_button.setEnabled(
-            not busy and bool(self.selected_empty_folders))
-        self.empty_folder_issue_button.setEnabled(bool(self.empty_folder_issues))
-        self.empty_folder_issue_button.setText(
-            f"Skipped folders / errors ({len(self.empty_folder_issues):,})")
+        self.open_button.setEnabled(not duplicates_busy and current_is_file)
+        self.select_folder_button.setEnabled(not duplicates_busy and current_is_file)
+        self.recycle_duplicate_folders_button.setEnabled(
+            not folders_busy and bool(self.selected_duplicate_folders))
+        self.clear_duplicate_folders_button.setEnabled(
+            not folders_busy and bool(self.selected_duplicate_folders))
+        self.duplicate_folder_issue_button.setEnabled(bool(self.duplicate_folder_issues))
+        self.duplicate_folder_issue_button.setText(
+            f"Skipped folders / errors ({len(self.duplicate_folder_issues):,})")
         amount = sum(self.records[path].total_size for path in self.selected)
         noun = "file" if len(self.selected) == 1 else "files"
         hidden = len(self.selected - self.visible_paths)
@@ -969,9 +1016,9 @@ class MainWindow(QMainWindow):
         group_noun = "group" if affected == 1 else "groups"
         self.selection_label.setText(
             f"{len(self.selected):,} {noun} selected  ·  {affected:,} {group_noun}  ·  {format_bytes(amount)}{suffix}")
-        folder_noun = "folder" if len(self.selected_empty_folders) == 1 else "folders"
-        self.empty_folder_selection_label.setText(
-            f"{len(self.selected_empty_folders):,} {folder_noun} selected for recycling")
+        folder_noun = "folder" if len(self.selected_duplicate_folders) == 1 else "folders"
+        self.duplicate_folder_selection_label.setText(
+            f"{len(self.selected_duplicate_folders):,} {folder_noun} selected for recycling")
 
     def apply_result_filters(self):
         sizes = []
@@ -1155,27 +1202,48 @@ class MainWindow(QMainWindow):
             finally:
                 self.tree.setSortingEnabled(sorting)
 
-    def start_job(self, job, handler, error_handler=None):
+    def start_job(self, job, handler, error_handler=None, *, scan_run=False):
         self.thumbnails.clear()
         self.comparison_preview.clear()
-        self.worker = Worker(job, self)
-        self.worker.progress.connect(self.on_progress)
-        self.worker.outcome.connect(handler)
-        self.worker.failed.connect(error_handler or self.on_failure)
-        self.worker.finished.connect(self.job_finished)
+        worker = Worker(job, self, scan_run=scan_run)
+        if scan_run:
+            self.scan_worker = worker
+            worker.mode_started.connect(self.on_mode_started)
+            worker.mode_finished.connect(self.on_mode_finished)
+            worker.progress.connect(self.on_scan_progress)
+            worker.failed.connect(self.on_scan_failure)
+            worker.finished.connect(self.scan_job_finished)
+            worker.paused.connect(self.on_scan_paused)
+        else:
+            self.worker = worker
+            worker.progress.connect(self.on_progress)
+            worker.failed.connect(error_handler or self.on_failure)
+            worker.finished.connect(self.job_finished)
+        worker.outcome.connect(handler)
         self.update_actions()
-        self.worker.start()
+        worker.start()
 
     def start_scan(self):
         modes, types, criteria = self.selected_modes(), self.selected_file_types(), self.search_criteria()
-        if (self.worker is not None or not self.folders.count() or not modes
+        if (self.worker is not None or self.scan_worker is not None or not self.folders.count() or not modes
                 or ("duplicates" in modes and not criteria.enabled)
-                or (any(mode != "empty" for mode in modes) and types == ())):
+                or (any(mode != "folders" for mode in modes) and types == ())):
             return
         roots = tuple(self.folders.item(i).text() for i in range(self.folders.count()))
         recursive, exclusions = self.recursive.isChecked(), self.excluded_folder_paths()
         preset = self.similarity_preset.currentText()
+        self._incremental_run = False
+        self._scan_baselines = {}
+        self._baseline_settings = None
+        self._scan_recycled = []
+        self._scan_cache_valid = True
+        self._scan_settings = self.current_scan_settings()
+        self._scan_paused = False
         self._scan_modes_running = modes
+        self.scan_mode_states = {mode: "Waiting" for mode in modes}
+        self._scan_messages = {}
+        self._last_scan_progress = None
+        self.update_scan_tab_titles()
         self.similar_tab.clear_preview()
         if "duplicates" in modes:
             self.session_available = False
@@ -1187,33 +1255,134 @@ class MainWindow(QMainWindow):
             self.empty.setText("Comparing the selected file types using your duplicate criteria. No files will be changed.")
         if "similarity" in modes:
             self.similar_tab.prepare_scan()
-        if "empty" in modes:
-            self.set_empty_folders([])
-            self.empty_folder_issues = []
-            self.empty_folder_summary.setText("Waiting for empty-folder scan…")
-            self.empty_folder_hint.setText("Every entry is inspected, regardless of the chosen file types.")
-        pages = {"duplicates": self.duplicate_page, "similarity": self.similar_tab, "empty": self.empty_page}
+        if "folders" in modes:
+            self.set_duplicate_folders([])
+            self.duplicate_folder_issues = []
+            self.duplicate_folder_summary.setText("Waiting for duplicate-folder scan…")
+            self.duplicate_folder_hint.setText("Every file is compared, regardless of file-type or duplicate-file criteria. Excluded content disqualifies its parent folders.")
+        pages = {"duplicates": self.duplicate_page, "similarity": self.similar_tab, "folders": self.folder_page}
         self.workflow_tabs.setCurrentWidget(pages[modes[0]])
         self.status.setText("Starting selected scans…")
         self.start_job(lambda **kwargs: run_selected_scans(roots, recursive, modes=modes,
             excluded_folders=exclusions, file_types=types, criteria=criteria, preset=preset, **kwargs),
-            self.on_scan_run)
+            self.on_scan_run, scan_run=True)
 
-    def on_scan_run(self, outcome):
+    @staticmethod
+    def normalized_roots(roots):
+        return {Path(os.path.normcase(os.path.abspath(root))) for root in roots}
+
+    def added_scan_scope(self):
+        if self._baseline_settings is None or not self._scan_baselines:
+            return (), "Complete a fresh scan first. Loaded sessions do not include the inventory needed for added-folder scans."
+        current = self.current_scan_settings()
+        old = self._baseline_settings
+        # Root order is irrelevant. All criteria and mode choices must stay fixed.
+        if (current[1] != old[1] or self.normalized_roots(current[2]) != self.normalized_roots(old[2])
+                or current[3:] != old[3:]):
+            return (), "Scan settings changed. Use Scan for a fresh scan, or restore the previous settings."
+        old_roots, roots = self.normalized_roots(old[0]), self.normalized_roots(current[0])
+        if not old_roots.issubset(roots):
+            return (), "Previously scanned roots were removed. Use Scan for a fresh scan."
+        added = roots - old_roots
+        if any(new in root.parents for new in added for root in old_roots):
+            return (), "An added folder contains a previously scanned root. Use Scan for that overlapping scope."
+        if current[1]:
+            added = {path for path in added if not any(root in path.parents for root in old_roots)}
+        if not added:
+            return (), "Add a folder outside the locations already scanned."
+        return tuple(str(path) for path in sorted(added)), ""
+
+    def start_added_scan(self):
+        roots, reason = self.added_scan_scope()
+        if self.worker is not None or self.scan_worker is not None or reason or not roots:
+            return
+        settings = self.current_scan_settings()
+        self._scan_settings = settings
+        self._incremental_states = dict(self.scan_mode_states)
+        self._incremental_run = True
+        self._scan_paused = False
+        modes = settings[3]
+        self._scan_modes_running = modes
+        self.scan_mode_states = {mode: "Waiting" for mode in modes}
+        self._scan_messages = {}
+        self._last_scan_progress = None
+        previous = dict(self._scan_baselines)
+        self.update_scan_tab_titles()
+        self.status.setText(f"Scanning {len(roots):,} added locations; previous results are retained…")
+        self.start_job(lambda **kwargs: run_selected_scans(roots, settings[1], modes=modes,
+            excluded_folders=settings[2], file_types=settings[4], criteria=settings[5], preset=settings[6],
+            previous=previous, **kwargs), self.on_scan_run, scan_run=True)
+
+    def current_scan_settings(self):
+        return (tuple(self.folders.item(i).text() for i in range(self.folders.count())),
+                self.recursive.isChecked(), self.excluded_folder_paths(), self.selected_modes(),
+                self.selected_file_types(), self.search_criteria(), self.similarity_preset.currentText())
+
+    def toggle_scan_pause(self):
+        if self.scan_worker is None or self.worker is not None or self.scan_worker.cancel_event.is_set():
+            return
+        control = self.scan_worker.cancel_event
+        if not self._scan_paused:
+            self._scan_paused = True
+            control.pause()
+            self.status.setText("Pausing after the current read or media decode… You can edit scan locations and criteria.")
+        elif self.current_scan_settings() != self._scan_settings:
+            modes, types, criteria = self.selected_modes(), self.selected_file_types(), self.search_criteria()
+            if (not self.folders.count() or not modes or ("duplicates" in modes and not criteria.enabled)
+                    or (any(mode != "folders" for mode in modes) and types == ())):
+                QMessageBox.warning(self, "Cannot restart scan", "Choose folders, scan modes, and valid search criteria first.")
+                return
+            self._restart_scan = True
+            self._scan_paused = False
+            control.set()
+            self.status.setText("Restarting with the updated scan locations and criteria…")
+        else:
+            self._scan_paused = False
+            control.resume()
+            if self._last_scan_progress:
+                self.on_progress(self._last_scan_progress)
+            else:
+                self.status.setText("Resuming scan…")
+        self.update_actions()
+
+    def on_scan_paused(self):
+        if self._scan_paused and self.scan_worker is not None:
+            self.status.setText("Scan paused. Add disks or change criteria, then Resume. Changed settings restart the scan.")
+
+    def update_scan_tab_titles(self):
+        pages = {"duplicates": self.duplicate_page, "similarity": self.similar_tab, "folders": self.folder_page}
+        for mode, page in pages.items():
+            state = self.scan_mode_states.get(mode)
+            title = SCAN_MODES[mode] + (f" · {state}" if state else "")
+            self.workflow_tabs.setTabText(self.workflow_tabs.indexOf(page), title)
+
+    def on_mode_started(self, mode):
+        self.scan_mode_states[mode] = "Scanning"
+        self.update_scan_tab_titles()
+        self.on_scan_progress(Progress(f"{SCAN_MODES[mode]} · Starting", 0, 0, ""))
+
+    def on_mode_finished(self, mode, result, error=""):
+        # Results are delivered once. Final scan completion must not reset checks
+        # or restore files already recycled while a later mode was scanning.
+        if mode in self._scan_messages:
+            return
+        if self._incremental_run:
+            self._scan_messages[mode] = f"{SCAN_MODES[mode]}: {'failed' if error else 'cancelled' if result is None or result.cancelled else 'ready'}"
+            self.scan_mode_states[mode] = "Failed" if error else "Cancelled" if result is None or result.cancelled else "Ready"
+            self.update_scan_tab_titles()
+            self.update_actions()
+            return
         handlers = {"duplicates": self.on_scan, "similarity": self.similar_tab.on_result,
-                    "empty": self.on_empty_folder_scan}
-        messages = []
-        for mode in self._scan_modes_running:
-            title = SCAN_MODES[mode]
-            if mode in outcome.results:
-                result = outcome.results[mode]
-                handlers[mode](result)
-                count = len(result.folders) if mode == "empty" else len(result.groups)
-                messages.append(f"{title}: cancelled" if result.cancelled else
-                                f"{title}: {count} {'folders' if mode == 'empty' else 'groups'}")
-                continue
-            message = ("Scan failed: " + outcome.errors[mode]) if mode in outcome.errors else "Not run — scan cancelled"
-            messages.append(f"{title}: {message}")
+                    "folders": self.on_duplicate_folder_scan}
+        previous_status = self.status.text()
+        if result is not None:
+            handlers[mode](result)
+            state = "Cancelled" if result.cancelled else "Ready"
+            count = len(result.folders) if mode == "folders" else len(result.groups)
+            message = "cancelled" if result.cancelled else f"{count} {'folders' if mode == 'folders' else 'groups'}"
+        else:
+            state = "Failed" if error else "Cancelled"
+            message = "Scan failed: " + error if error else "Not run — scan cancelled"
             if mode == "duplicates":
                 self.summary_notice = message
                 self.set_groups([])
@@ -1221,12 +1390,153 @@ class MainWindow(QMainWindow):
                 self.similar_tab.summary.setText(message)
                 self.similar_tab.status.setText(message)
             else:
-                self.empty_folder_summary.setText(message)
+                self.duplicate_folder_summary.setText(message)
+        self._scan_messages[mode] = f"{SCAN_MODES[mode]}: {message}"
+        self.scan_mode_states[mode] = state
+        if self.worker is not None:
+            self.status.setText(previous_status)
+        self.update_scan_tab_titles()
+        self.update_actions()
+
+    def on_scan_progress(self, progress):
+        self._last_scan_progress = progress
+        if self.worker is None and not self._scan_paused:
+            self.on_progress(progress)
+
+    def on_scan_run(self, outcome):
+        if self._incremental_run:
+            success = (not outcome.cancelled and not outcome.errors and
+                       set(outcome.results) == set(self._scan_modes_running) and
+                       all(not result.cancelled for result in outcome.results.values()))
+            if success:
+                selected_files, selected_folders = set(self.selected), set(self.selected_duplicate_folders)
+                for mode, result in outcome.results.items():
+                    if mode == "duplicates":
+                        self.on_scan(result)
+                    elif mode == "folders":
+                        self.on_duplicate_folder_scan(result)
+                    else:
+                        self.similar_tab.on_result(result)
+                self.restore_scan_selection(selected_files, selected_folders)
+                self._scan_baselines = dict(outcome.results)
+                self._baseline_settings = self._scan_settings
+                self.scan_mode_states = {mode: "Ready" for mode in self._scan_modes_running}
+                self.status.setText("Added-folder scan complete. Results combined; existing checks retained and new items unchecked.")
+            else:
+                self.scan_mode_states = dict(self._incremental_states)
+                errors = " · ".join(outcome.errors.values())
+                self.status.setText("Added-folder scan cancelled; previous results and checks retained." if outcome.cancelled
+                                    else "Added-folder scan failed; previous results and checks retained. " + errors)
+            self.update_scan_tab_titles()
+            self.update_actions()
+            return
+        for mode in self._scan_modes_running:
+            self.on_mode_finished(mode, outcome.results.get(mode), outcome.errors.get(mode, ""))
+        if (self._scan_cache_valid and not outcome.cancelled and not outcome.errors and
+                set(outcome.results) == set(self._scan_modes_running)):
+            self._scan_baselines = dict(outcome.results)
+            self._baseline_settings = self._scan_settings
+            for paths, folders in self._scan_recycled:
+                self.prune_scan_baselines(paths, folders=folders)
         state = "Cancelled" if outcome.cancelled else "Finished with errors" if outcome.errors else "Scan complete"
-        self.status.setText(state + " · " + " · ".join(messages))
+        if self.worker is None:
+            self.status.setText(state + " · " + " · ".join(self._scan_messages.values()))
+
+    def on_scan_failure(self, message):
+        if self._incremental_run:
+            self.scan_mode_states = dict(self._incremental_states)
+            self.status.setText("Added-folder scan failed; previous results and checks retained. " + message)
+            self.update_scan_tab_titles()
+            return
+        for mode in self._scan_modes_running:
+            self.on_mode_finished(mode, None, message)
+        if self.worker is None:
+            self.status.setText("Scan stopped · " + message)
+
+    def scan_job_finished(self):
+        worker = self.scan_worker
+        self.scan_worker = None
+        self._incremental_run = False
+        self._scan_paused = False
+        if worker:
+            worker.deleteLater()
+        if self.worker is None:
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(100)
+            self.current_path.clear()
+        self.update_actions()
+        self.restart_scan_if_ready()
+
+    def restart_scan_if_ready(self):
+        if self._restart_scan and self.scan_worker is None and self.worker is None:
+            self._restart_scan = False
+            self.start_scan()
+
+    def restore_scan_selection(self, files, folders):
+        self._changing_checks = True
+        self._changing_empty_checks = True
+        try:
+            self.selected = files.intersection(self.records)
+            self.selected_duplicate_folders = folders.intersection(record.path for record in self.duplicate_folders)
+            for item in self.file_items():
+                item.setCheckState(0, Qt.CheckState.Checked if item.data(0, Qt.ItemDataRole.UserRole).path in self.selected else Qt.CheckState.Unchecked)
+            for item in self.duplicate_folder_items():
+                item.setCheckState(0, Qt.CheckState.Checked if item.data(0, Qt.ItemDataRole.UserRole).path in self.selected_duplicate_folders else Qt.CheckState.Unchecked)
+        finally:
+            self._changing_checks = False
+            self._changing_empty_checks = False
+        self.refresh_selection_view()
+
+    def prune_scan_baselines(self, paths, *, folders=False):
+        paths = set(paths)
+        if not paths:
+            return
+        def removed(path):
+            return path in paths or (folders and any(root in path.parents for root in paths))
+
+        for mode, result in tuple(self._scan_baselines.items()):
+            if mode == "duplicates":
+                index = {path: item for path, item in result.index.items() if not removed(path)}
+                groups = []
+                for group in result.groups:
+                    files = tuple(record for record in group.files if not removed(record.path))
+                    if len(files) > 1:
+                        groups.append(DuplicateGroup(files, group.digest, group.byte_verified))
+                self._scan_baselines[mode] = replace(result, index=index, groups=groups,
+                    file_count=len(index), total_bytes=sum(item.record.total_size for item in index.values()))
+            elif mode == "similarity":
+                images = tuple(image for image in result.images if not removed(image.record.path))
+                videos = tuple(video for video in result.videos if not removed(video.record.path))
+                groups = []
+                for group in result.groups:
+                    if removed(group.reference.record.path):
+                        continue
+                    matches = tuple((item, distance) for item, distance in group.matches if not removed(item.record.path))
+                    if matches:
+                        groups.append(type(group)(group.reference, matches))
+                self._scan_baselines[mode] = replace(result, images=images, videos=videos, groups=groups,
+                    image_count=len(images), video_count=len(videos), compared_count=len(images) + len(videos),
+                    videos_compared=len(videos))
+            else:
+                index = {path: tree for path, tree in result.index.items()
+                         if not any(removed(file.path) for file in tree.files)
+                         and not (folders and any(path == root or path in root.parents or root in path.parents for root in paths))}
+                groups = []
+                for group in result.groups:
+                    copies = tuple(tree for tree in group.folders if tree.path in index)
+                    if len(copies) > 1 or (copies and copies[0].empty):
+                        groups.append(FolderGroup(copies))
+                known_files = {file.path for tree in index.values() for file in tree.files}
+                self._scan_baselines[mode] = replace(result, index=index, groups=groups,
+                    file_ids={path: value for path, value in result.file_ids.items() if path in known_files})
+
+    def record_scan_cleanup(self, paths, *, folders=False):
+        self.prune_scan_baselines(paths, folders=folders)
+        if self.scan_worker is not None and not self._incremental_run:
+            self._scan_recycled.append((tuple(paths), folders))
 
     def save_session(self):
-        if self.worker is not None or not self.session_available:
+        if self.mode_busy("duplicates") or not self.session_available:
             return
         if self.session_path is None:
             default = Path.home() / f"Duplicate Cleaner {datetime.now():%Y-%m-%d %H%M}.dupsession"
@@ -1261,7 +1571,7 @@ class MainWindow(QMainWindow):
         self.status.setText(f"Session saved · {result.path}")
 
     def load_session(self):
-        if self.worker is not None:
+        if self.worker is not None or self.scan_worker is not None:
             return
         filename, _ = QFileDialog.getOpenFileName(
             self, "Load Duplicate Cleaner session", str(Path.home()),
@@ -1315,6 +1625,8 @@ class MainWindow(QMainWindow):
             self.status.setText("Session load cancelled. Current results were not changed.")
             return
         restore_checks = restore is not None and clicked == restore
+        self._scan_baselines = {}
+        self._baseline_settings = None
 
         self.workflow_tabs.setCurrentWidget(self.duplicate_page)
         self.issues = list(data.issues) + list(result.validation_issues)
@@ -1362,6 +1674,12 @@ class MainWindow(QMainWindow):
         self.status.setText(message)
         QMessageBox.critical(self, title, message + "\n\nCurrent results were not changed.")
 
+    @staticmethod
+    def group_file_size(group):
+        sizes = [record.total_size for record in group.files]
+        low, high = min(sizes), max(sizes)
+        return format_bytes(low) if low == high else f"{format_bytes(low)} – {format_bytes(high)}"
+
     def set_groups(self, groups):
         self.thumbnails.clear()
         self.comparison_preview.clear()
@@ -1378,14 +1696,15 @@ class MainWindow(QMainWindow):
             self.tree.clear()
             for number, group in enumerate(groups, 1):
                 parent = ResultItem(self.tree, [
-                    f"Group {number} · {group.metadata_status} · {len(group.files)} files", "", "", "",
+                    f"Group {number} · {group.metadata_status} · {len(group.files)} files", "",
+                    self.group_file_size(group), "",
                 ])
                 # Status text changes when checking files. Keep it out of sorting, and break
                 # equal-key ties by the scan's group number so selection cannot reshuffle rows.
                 parent.group_sort_keys = tuple((value, number) for value in (
                     parent.text(0).casefold(), min(str(record.path).casefold() for record in group.files),
-                    group.extra_bytes, ""))
-                parent.setData(2, Qt.ItemDataRole.UserRole, group.extra_bytes)
+                    min(record.total_size for record in group.files), ""))
+                parent.setData(2, Qt.ItemDataRole.UserRole, min(record.total_size for record in group.files))
                 parent.setData(0, Qt.ItemDataRole.UserRole, group)
                 parent.setToolTip(0, f"{group.metadata_status}\nScan SHA-256: {group.digest or 'Not calculated'}")
                 font = QFont()
@@ -1421,7 +1740,7 @@ class MainWindow(QMainWindow):
         self.refresh_selection_view()
 
     def preview_selection_changed(self, path, checked):
-        if self.worker is not None:
+        if self.mode_busy("duplicates"):
             return
         for item in self.file_items():
             if item.data(0, Qt.ItemDataRole.UserRole).path == path:
@@ -1435,7 +1754,7 @@ class MainWindow(QMainWindow):
                 yield parent.child(child_index)
 
     def select_folder_duplicates(self, item=None):
-        if self.worker is not None:
+        if self.mode_busy("duplicates"):
             return
         if item is None:
             item = self.tree.currentItem()
@@ -1493,7 +1812,7 @@ class MainWindow(QMainWindow):
         open_location.triggered.connect(self.open_folder)
         menu.addSeparator()
         select_folder = menu.addAction("Select this folder's duplicates (keep one copy)")
-        select_folder.setEnabled(self.worker is None)
+        select_folder.setEnabled(not self.mode_busy("duplicates"))
         select_folder.triggered.connect(lambda: self.select_folder_duplicates(item))
         menu.exec(self.tree.viewport().mapToGlobal(position))
 
@@ -1518,7 +1837,7 @@ class MainWindow(QMainWindow):
         is_file = item.parent() is not None
         group = (item.parent() if is_file else item).data(0, Qt.ItemDataRole.UserRole)
         record = item.data(0, Qt.ItemDataRole.UserRole) if is_file else group.files[0]
-        if self.preview_toggle.isChecked() and self.worker is None:
+        if self.preview_toggle.isChecked() and not self.mode_busy("duplicates"):
             self.comparison_preview.set_group(group, record if is_file else None, self.selected)
         else:
             self.comparison_preview.clear()
@@ -1556,7 +1875,7 @@ class MainWindow(QMainWindow):
             self.results_splitter.setSizes([max(290, width * 2 // 5), max(380, width * 3 // 5)])
 
     def open_file(self, item, column=0):
-        if self.worker is not None or item is None or item.parent() is None:
+        if self.mode_busy("duplicates") or item is None or item.parent() is None:
             return
         self.thumbnails.dismiss()
         record = item.data(0, Qt.ItemDataRole.UserRole)
@@ -1604,115 +1923,157 @@ class MainWindow(QMainWindow):
                             f"{result.file_count:,} files discovered  ·  {format_bytes(result.total_bytes)}  ·  "
                             f"{len(result.issues):,} skipped / errors")
 
-    def set_empty_folders(self, folders):
-        self.empty_folders = list(folders)
-        self.selected_empty_folders.clear()
+    def set_duplicate_folders(self, groups):
+        self.folder_groups = list(groups)
+        self.duplicate_folders = [folder for group in self.folder_groups for folder in group.folders]
+        self.selected_duplicate_folders.clear()
         self._changing_empty_checks = True
-        self.empty_folder_tree.setSortingEnabled(False)
-        self.empty_folder_tree.setUpdatesEnabled(False)
+        self.duplicate_folder_tree.setSortingEnabled(False)
+        self.duplicate_folder_tree.setUpdatesEnabled(False)
         try:
-            self.empty_folder_tree.clear()
-            for record in self.empty_folders:
-                modified = datetime.fromtimestamp(record.modified_ns / 1_000_000_000)
-                item = ResultItem(self.empty_folder_tree, [
-                    record.path.name, str(record.path), modified.strftime("%Y-%m-%d %H:%M:%S")])
-                item.setData(0, Qt.ItemDataRole.UserRole, record)
-                item.setData(2, Qt.ItemDataRole.UserRole, record.modified_ns)
-                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                item.setCheckState(0, Qt.CheckState.Unchecked)
-                item.setToolTip(0, str(record.path))
-                item.setToolTip(1, str(record.path))
+            self.duplicate_folder_tree.clear()
+            for number, group in enumerate(self.folder_groups, 1):
+                parent = ResultItem(self.duplicate_folder_tree, [
+                    "Empty folders" if all(folder.empty for folder in group.folders) else f"Group {number} · {len(group.folders)} folders",
+                    "", self.group_folder_size(group), str(len(group.folders[0].files))])
+                parent.group_sort_keys = (parent.text(0), "", group.folders[0].total_size, len(group.folders[0].files))
+                parent.setData(0, Qt.ItemDataRole.UserRole, group)
+                for record in group.folders:
+                    item = ResultItem(parent, [record.path.name, str(record.path),
+                                              format_bytes(record.total_size), str(len(record.files))])
+                    item.setData(0, Qt.ItemDataRole.UserRole, record)
+                    item.setData(2, Qt.ItemDataRole.UserRole, record.total_size)
+                    item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                    item.setCheckState(0, Qt.CheckState.Unchecked)
+                    item.setToolTip(0, str(record.path))
+                    item.setToolTip(1, str(record.path))
+                parent.setExpanded(True)
         finally:
-            self.empty_folder_tree.setSortingEnabled(True)
-            self.empty_folder_tree.setUpdatesEnabled(True)
+            self.duplicate_folder_tree.setSortingEnabled(True)
+            self.duplicate_folder_tree.setUpdatesEnabled(True)
             self._changing_empty_checks = False
         self.update_actions()
 
-    def empty_folder_items(self):
-        for index in range(self.empty_folder_tree.topLevelItemCount()):
-            yield self.empty_folder_tree.topLevelItem(index)
+    def duplicate_folder_items(self):
+        for index in range(self.duplicate_folder_tree.topLevelItemCount()):
+            parent = self.duplicate_folder_tree.topLevelItem(index)
+            for child in range(parent.childCount()):
+                yield parent.child(child)
 
-    def empty_folder_item_changed(self, item, column):
-        if self._changing_empty_checks or column != 0:
+    @staticmethod
+    def group_folder_size(group):
+        sizes = [folder.total_size for folder in group.folders]
+        low, high = min(sizes), max(sizes)
+        return format_bytes(low) if low == high else f"{format_bytes(low)} – {format_bytes(high)}"
+
+    def duplicate_folder_item_changed(self, item, column):
+        if self._changing_empty_checks or column != 0 or item.parent() is None:
             return
         record = item.data(0, Qt.ItemDataRole.UserRole)
         if item.checkState(0) == Qt.CheckState.Checked:
-            self.selected_empty_folders.add(record.path)
+            self.selected_duplicate_folders.add(record.path)
         else:
-            self.selected_empty_folders.discard(record.path)
+            self.selected_duplicate_folders.discard(record.path)
         self.update_actions()
 
-    def clear_empty_folder_selection(self):
+    def clear_duplicate_folder_selection(self):
         self._changing_empty_checks = True
         try:
-            for item in self.empty_folder_items():
+            for item in self.duplicate_folder_items():
                 item.setCheckState(0, Qt.CheckState.Unchecked)
         finally:
             self._changing_empty_checks = False
-        self.selected_empty_folders.clear()
+        self.selected_duplicate_folders.clear()
         self.update_actions()
 
-    def on_empty_folder_scan(self, result: EmptyFolderScanResult):
-        self.empty_folder_issues = result.issues
-        self.set_empty_folders(result.folders)
+    def on_duplicate_folder_scan(self, result: FolderScanResult):
+        self.duplicate_folder_issues = result.issues
+        self.set_duplicate_folders(result.groups)
         if result.cancelled:
-            self.empty_folder_summary.setText("Empty-folder scan cancelled — no folders changed")
-            self.empty_folder_hint.setText(
-                "Start another empty-folder scan when ready. Partial results are not used for cleanup.")
+            self.duplicate_folder_summary.setText("Duplicate-folder scan cancelled — no folders changed")
+            self.duplicate_folder_hint.setText(
+                "Start another duplicate-folder scan when ready. Partial results are not used for cleanup.")
         else:
             noun = "folder" if len(result.folders) == 1 else "folders"
-            self.empty_folder_summary.setText(
-                f"{len(result.folders):,} empty {noun} found · nothing selected automatically")
-            self.empty_folder_hint.setText(
-                "No empty folders found." if not result.folders else
+            self.duplicate_folder_summary.setText(
+                f"{len(result.folders):,} duplicate / empty {noun} found · nothing selected automatically")
+            self.duplicate_folder_hint.setText(
+                "No duplicate or empty folders found." if not result.folders else
                 "Review full paths and check only the folders you want to recycle. "
                 "Rescan after cleanup to discover parent folders that have become empty.")
         self.status.setText(
-            f"{'Cancelled' if result.cancelled else 'Empty-folder scan complete'}  ·  "
+            f"{'Cancelled' if result.cancelled else 'Duplicate-folder scan complete'}  ·  "
             f"{result.folder_count:,} folders inspected  ·  {len(result.issues):,} skipped / errors")
 
-    def confirm_empty_folder_recycle(self):
-        if self.worker is not None or not self.selected_empty_folders:
+    def confirm_duplicate_folder_recycle(self):
+        if self.mode_busy("folders") or not self.selected_duplicate_folders:
             return
-        selected = frozenset(self.selected_empty_folders)
-        folders = tuple(self.empty_folders)
+        selected = frozenset(self.selected_duplicate_folders)
+        groups = tuple(self.folder_groups)
+        if any(first != second and (first in second.parents or second in first.parents)
+               for first in selected for second in selected):
+            QMessageBox.warning(self, "Overlapping folder selection", "Select either a parent folder or its descendants, not both.")
+            return
         dialog = QMessageBox(self)
-        dialog.setWindowTitle("Confirm empty-folder recycling")
+        dialog.setWindowTitle("Confirm duplicate-folder recycling")
         dialog.setIcon(QMessageBox.Icon.Warning)
         noun = "folder" if len(selected) == 1 else "folders"
-        dialog.setText(f"Send {len(selected):,} selected empty {noun} to the Recycle Bin?")
+        dialog.setText(f"Send {len(selected):,} selected {noun} and everything inside them to the Recycle Bin?")
+        all_selected = any(group.folders[0].files and all(folder.path in selected for folder in group.folders)
+                           for group in groups)
         dialog.setInformativeText(
-            "Only checked folders will be recycled. Each folder must still be empty, unchanged, and safe. "
-            "Anything that fails these checks will be skipped. Nothing is permanently deleted.")
-        dialog.setDetailedText("SELECTED EMPTY FOLDERS\n" + "\n".join(sorted(map(str, selected))))
+            ("All copies in at least one group are selected; no listed copy will remain.\n\n" if all_selected else "")
+            + "Complete folder contents are rechecked. Changed folders or different NTFS streams are skipped. "
+            "Avoid folders being modified or synchronized during cleanup. Nothing is permanently deleted.")
+        details = ["SELECTED FOLDERS", *sorted(map(str, selected)), "", "UNCHECKED COMPARISON FOLDERS"]
+        details.extend(str(folder.path) for group in groups if any(folder.path in selected for folder in group.folders)
+                       for folder in group.folders if folder.path not in selected)
+        dialog.setDetailedText("\n".join(details))
         recycle = dialog.addButton("Recycle selected folders", QMessageBox.ButtonRole.AcceptRole)
         cancel = dialog.addButton(QMessageBox.StandardButton.Cancel)
         dialog.setDefaultButton(cancel)
         dialog.exec()
         if dialog.clickedButton() != recycle:
             return
-        self.empty_folder_issues = []
+        self.duplicate_folder_issues = []
         self.start_job(
-            lambda **kwargs: recycle_empty_folders(folders, selected, **kwargs),
-            self.on_empty_folders_recycled, self.on_empty_folder_failure,
+            lambda **kwargs: recycle_duplicate_folders(groups, selected, **kwargs),
+            self.on_duplicate_folders_recycled, self.on_duplicate_folder_failure,
         )
 
-    def on_empty_folders_recycled(self, result: EmptyFolderRecycleResult):
-        self.empty_folder_issues = result.issues
+    def on_duplicate_folders_recycled(self, result: RecycleResult):
+        self.record_scan_cleanup(result.recycled, folders=True)
+        self.duplicate_folder_issues = result.issues
         recycled = set(result.recycled)
-        self.set_empty_folders(
-            record for record in self.empty_folders if record.path not in recycled)
-        noun = "folder" if len(self.empty_folders) == 1 else "folders"
-        self.empty_folder_summary.setText(
-            f"{len(self.empty_folders):,} listed empty {noun} remaining · all checks cleared")
-        self.empty_folder_hint.setText(
+        remaining = []
+        for group in self.folder_groups:
+            folders = tuple(folder for folder in group.folders
+                            if not any(folder.path == path or path in folder.path.parents
+                                       or folder.path in path.parents for path in recycled))
+            if len(folders) > 1 or (folders and folders[0].empty):
+                remaining.append(FolderGroup(folders))
+        self.set_duplicate_folders(remaining)
+        if recycled:
+            file_groups = []
+            for group in self.groups:
+                files = tuple(file for file in group.files
+                              if not any(path in file.path.parents for path in recycled))
+                if len(files) > 1:
+                    file_groups.append(DuplicateGroup(files, group.digest, group.byte_verified))
+            self.set_groups(file_groups)
+            self.similar_tab.on_result(SimilarResult())
+            self.similar_tab.summary.setText("Folder cleanup changed files. Scan again to refresh similar results.")
+        noun = "folder" if len(self.duplicate_folders) == 1 else "folders"
+        self.duplicate_folder_summary.setText(
+            f"{len(self.duplicate_folders):,} listed {noun} remaining · all checks cleared")
+        self.duplicate_folder_hint.setText(
             "Rescan to refresh changed folders and discover parent folders that became empty.")
         self.status.setText(
-            "Empty-folder cleanup cancelled; already recycled folders remain in the Recycle Bin."
+            "Duplicate-folder cleanup cancelled; already recycled folders remain in the Recycle Bin."
             if result.cancelled else
-            "Empty-folder cleanup complete. No permanent deletion was requested.")
+            "Duplicate-folder cleanup complete. No permanent deletion was requested.")
         dialog = QMessageBox(self)
-        dialog.setWindowTitle("Empty-folder recycling results")
+        dialog.setWindowTitle("Duplicate-folder recycling results")
         dialog.setText(
             f"{len(result.recycled):,} folders recycled  ·  {len(result.issues):,} skipped / errors")
         dialog.setInformativeText(
@@ -1722,20 +2083,23 @@ class MainWindow(QMainWindow):
              *(f"{issue.path}: {issue.reason}" for issue in result.issues)]))
         dialog.exec()
 
-    def on_empty_folder_failure(self, message):
-        self.set_empty_folders(self.empty_folders)
-        self.empty_folder_summary.setText(
-            "Operation stopped · empty-folder results may be out of date"
-            if self.empty_folders else "Empty-folder operation stopped")
-        self.empty_folder_hint.setText(
-            "Scan empty folders again before continuing. Check the Recycle Bin if cleanup was running.")
+    def on_duplicate_folder_failure(self, message):
+        self._scan_cache_valid = False
+        self._scan_baselines = {}
+        self._baseline_settings = None
+        self.set_duplicate_folders(self.folder_groups)
+        self.duplicate_folder_summary.setText(
+            "Operation stopped · duplicate-folder results may be out of date"
+            if self.duplicate_folders else "Duplicate-folder operation stopped")
+        self.duplicate_folder_hint.setText(
+            "Scan duplicate folders again before continuing. Check the Recycle Bin if cleanup was running.")
         self.status.setText(message)
         QMessageBox.critical(
-            self, "Empty-folder operation stopped",
+            self, "Duplicate-folder operation stopped",
             message + "\n\nThe duplicate-file results were not changed.")
 
     def confirm_recycle(self):
-        if self.worker is not None or not self.selected:
+        if self.mode_busy("duplicates") or not self.selected:
             return
         selected = frozenset(self.selected)
         groups = tuple(self.groups)
@@ -1825,6 +2189,16 @@ class MainWindow(QMainWindow):
         self.start_job(lambda **kwargs: recycle_selected(groups, selected, **options, **kwargs), self.on_recycled)
 
     def on_recycled(self, result: RecycleResult):
+        self.record_scan_cleanup(result.recycled)
+        if result.recycled:
+            recycled_paths = set(result.recycled)
+            remaining_folders = []
+            for group in self.folder_groups:
+                folders = tuple(folder for folder in group.folders
+                                if not any(file.path in recycled_paths for file in folder.files))
+                if len(folders) > 1 or (folders and folders[0].empty):
+                    remaining_folders.append(FolderGroup(folders))
+            self.set_duplicate_folders(remaining_folders)
         self.issues = result.issues
         recycled = set(result.recycled)
         remaining_groups = []
@@ -1849,6 +2223,9 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def on_failure(self, message):
+        self._scan_cache_valid = False
+        self._scan_baselines = {}
+        self._baseline_settings = None
         self.summary_notice = "Operation stopped · results may be out of date" if self.groups else "Operation stopped"
         self.set_groups(self.groups)
         self.empty.setText("Scan again before continuing. If cleanup was running, check the Recycle Bin for files already moved.")
@@ -1866,20 +2243,27 @@ class MainWindow(QMainWindow):
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(100)
         self.current_path.clear()
+        if self.scan_worker is not None and self._last_scan_progress is not None:
+            self.on_progress(self._last_scan_progress)
         self.update_actions()
         self.update_details()
+        self.restart_scan_if_ready()
 
     def cancel_work(self):
-        if self.worker:
-            self.worker.cancel_event.set()
+        self._restart_scan = False
+        self._scan_paused = False
+        if self.worker is not None or self.scan_worker is not None:
+            for worker in (self.worker, self.scan_worker):
+                if worker is not None:
+                    worker.cancel_event.set()
             self.status.setText("Stopping safely after the current read or Windows operation…")
             self.update_actions()
 
     def show_issues(self):
         self.show_issue_list("Skipped files and errors", self.issues)
 
-    def show_empty_folder_issues(self):
-        self.show_issue_list("Skipped folders and errors", self.empty_folder_issues)
+    def show_duplicate_folder_issues(self):
+        self.show_issue_list("Skipped folders and errors", self.duplicate_folder_issues)
 
     def show_issue_list(self, title, issues):
         dialog = QDialog(self)
@@ -1902,22 +2286,22 @@ class MainWindow(QMainWindow):
             if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(record.path.parent))):
                 QMessageBox.warning(self, "Could not open folder", str(record.path.parent))
 
-    def open_empty_folder(self, item, column=0):
-        if self.worker is not None or item is None:
+    def open_duplicate_folder(self, item, column=0):
+        if self.mode_busy("folders") or item is None or item.parent() is None:
             return
         record = item.data(0, Qt.ItemDataRole.UserRole)
         try:
-            ensure_empty_folder_current(record)
+            ensure_folder_current(record, Reporter(Event(), None))
         except OSError as exc:
             QMessageBox.warning(
-                self, "Cannot open this empty folder",
-                f"The folder changed, is no longer empty, or is unavailable. Scan again.\n\n{exc}")
+                self, "Cannot open this folder",
+                f"The folder changed or is unavailable. Scan again.\n\n{exc}")
             return
         if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(record.path))):
             QMessageBox.warning(self, "Could not open folder", str(record.path))
 
     def closeEvent(self, event: QCloseEvent):
-        if self.worker is not None:
+        if self.worker is not None or self.scan_worker is not None:
             self.cancel_work()
             event.ignore()
             self.status.setText("Stopping safely. Close the window again once the operation has stopped.")

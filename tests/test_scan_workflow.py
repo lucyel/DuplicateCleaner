@@ -1,7 +1,7 @@
 from threading import Event
 from unittest.mock import patch
 
-from duplicate_cleaner.empty_folders import EmptyFolderScanResult
+from duplicate_cleaner.duplicate_folders import FolderScanResult
 from duplicate_cleaner.file_types import accepts_file
 from duplicate_cleaner.models import Progress, ScanResult, SearchCriteria
 from duplicate_cleaner.scan_workflow import SCAN_MODES, run_selected_scans
@@ -12,12 +12,37 @@ from tests.test_similarity import sample_image
 
 
 class ScanWorkflowTests(FileTestCase):
+    def test_completed_mode_is_published_before_next_mode_starts(self):
+        events = []
+        completed = ScanResult()
+
+        def second(*args, **kwargs):
+            self.assertEqual(events, [("start", "duplicates"), ("done", "duplicates", completed, ""),
+                                      ("start", "folders")])
+            return FolderScanResult()
+
+        with patch("duplicate_cleaner.scan_workflow.scan", return_value=completed), \
+                patch("duplicate_cleaner.scan_workflow.scan_duplicate_folders", side_effect=second):
+            run_selected_scans([self.root], modes=("duplicates", "folders"),
+                on_mode_started=lambda mode: events.append(("start", mode)),
+                on_mode_finished=lambda *values: events.append(("done", *values)))
+        self.assertEqual(events[-1][0:2], ("done", "folders"))
+
+    def test_failed_mode_is_published_before_other_modes_continue(self):
+        events = []
+        with patch("duplicate_cleaner.scan_workflow.scan", side_effect=OSError("unavailable")), \
+                patch("duplicate_cleaner.scan_workflow.scan_duplicate_folders", return_value=FolderScanResult()):
+            run_selected_scans([self.root], modes=("duplicates", "folders"),
+                               on_mode_finished=lambda *values: events.append(values))
+        self.assertEqual(events[0], ("duplicates", None, "OSError: unavailable"))
+        self.assertEqual(events[1][0], "folders")
+
     def test_only_selected_modes_receive_the_same_scope(self):
-        for chosen in (("duplicates",), ("similarity",), ("empty",), tuple(SCAN_MODES)):
+        for chosen in (("duplicates",), ("similarity",), ("folders",), tuple(SCAN_MODES)):
             with self.subTest(modes=chosen), \
                     patch("duplicate_cleaner.scan_workflow.scan", return_value=ScanResult()) as duplicates, \
                     patch("duplicate_cleaner.scan_workflow.scan_similar", return_value=SimilarResult()) as similar, \
-                    patch("duplicate_cleaner.scan_workflow.scan_empty_folders", return_value=EmptyFolderScanResult()) as empty:
+                    patch("duplicate_cleaner.scan_workflow.scan_duplicate_folders", return_value=FolderScanResult()) as empty:
                 result = run_selected_scans([self.root], False, modes=chosen,
                     excluded_folders=[self.root / "exclude"], file_types=("Images", "Videos"), preset="Strict")
                 self.assertEqual(set(result.results), set(chosen))
@@ -26,7 +51,7 @@ class ScanWorkflowTests(FileTestCase):
                     if mode in chosen:
                         self.assertEqual(scanner.call_args.args, ((self.root,), False))
                         self.assertEqual(scanner.call_args.kwargs["excluded_folders"], (self.root / "exclude",))
-                        if mode != "empty":
+                        if mode != "folders":
                             self.assertEqual(scanner.call_args.kwargs["file_types"], frozenset(("Images", "Videos")))
                         else:
                             self.assertNotIn("file_types", scanner.call_args.kwargs)
@@ -39,7 +64,7 @@ class ScanWorkflowTests(FileTestCase):
             return SimilarResult(cancelled=True)
         with patch("duplicate_cleaner.scan_workflow.scan", return_value=completed), \
                 patch("duplicate_cleaner.scan_workflow.scan_similar", side_effect=stop), \
-                patch("duplicate_cleaner.scan_workflow.scan_empty_folders") as empty:
+                patch("duplicate_cleaner.scan_workflow.scan_duplicate_folders") as empty:
             result = run_selected_scans([self.root], modes=tuple(SCAN_MODES), cancel=cancel)
         self.assertTrue(result.cancelled)
         self.assertIs(result.results["duplicates"], completed)
@@ -48,10 +73,10 @@ class ScanWorkflowTests(FileTestCase):
 
     def test_failure_is_reported_and_other_selected_modes_continue(self):
         with patch("duplicate_cleaner.scan_workflow.scan", side_effect=OSError("unavailable")), \
-                patch("duplicate_cleaner.scan_workflow.scan_empty_folders", return_value=EmptyFolderScanResult()):
-            result = run_selected_scans([self.root], modes=("duplicates", "empty"))
+                patch("duplicate_cleaner.scan_workflow.scan_duplicate_folders", return_value=FolderScanResult()):
+            result = run_selected_scans([self.root], modes=("duplicates", "folders"))
         self.assertIn("unavailable", result.errors["duplicates"])
-        self.assertIn("empty", result.results)
+        self.assertIn("folders", result.results)
         self.assertFalse(result.cancelled)
 
     def test_invalid_options_do_not_start_scanners(self):
@@ -61,7 +86,7 @@ class ScanWorkflowTests(FileTestCase):
                     run_selected_scans([self.root], **options)
                 scanner.assert_not_called()
         # Folder scanning needs neither file types nor duplicate comparison criteria.
-        result = run_selected_scans([self.root], modes=("empty",), file_types=(),
+        result = run_selected_scans([self.root], modes=("folders",), file_types=(),
                                    criteria=SearchCriteria(contents=False, hashes=False, size=False))
         self.assertFalse(result.errors)
 
@@ -90,12 +115,12 @@ class ScanWorkflowTests(FileTestCase):
         self.assertEqual((result.image_count, result.video_count), (2, 0))
         self.assertFalse(scan_similar([self.root], media_kind="All", file_types=("Documents",)).groups)
 
-    def test_file_filters_never_make_a_nonempty_folder_empty(self):
-        empty = self.root / "empty"
+    def test_file_filters_never_make_a_nonduplicate_folder_empty(self):
+        empty = self.root / "folders"
         empty.mkdir()
         self.file("occupied/ignored.txt", b"must remain visible to emptiness checks")
-        result = run_selected_scans([self.root], modes=("empty",), file_types=("Images",))
-        self.assertEqual([folder.path for folder in result.results["empty"].folders], [empty])
+        result = run_selected_scans([self.root], modes=("folders",), file_types=("Images",))
+        self.assertEqual([folder.path for folder in result.results["folders"].folders], [empty])
 
     def test_progress_identifies_mode(self):
         reports = []

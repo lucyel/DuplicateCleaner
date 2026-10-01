@@ -15,6 +15,7 @@ from PySide6.QtCore import QBuffer, QIODevice, Qt
 from PySide6.QtGui import QImage, QPainter
 
 from .files import ensure_current, open_checked
+from .scan_control import check_scan, active_scan_time
 from .models import Cancelled, FileRecord, Progress
 
 VIDEO_SUFFIXES = {".mp4", ".m4v", ".mov", ".mkv", ".avi", ".webm"}
@@ -60,8 +61,7 @@ def decoder_path(name):
 
 def run_decoder(name, arguments, cancel, timeout=15, output_limit=1024 * 1024):
     """Bound subprocess time/output; disk-backed pipes avoid unbounded error buffering."""
-    if cancel.is_set():
-        raise Cancelled()
+    check_scan(cancel)
     flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
         with subprocess.Popen([str(decoder_path(name)), *arguments], stdin=subprocess.DEVNULL,
@@ -136,13 +136,12 @@ def read_video_fingerprint(record, cancel, progress=None):
         storyboard = QImage(COLUMNS * TILE_WIDTH, 4 * TILE_HEIGHT, QImage.Format.Format_RGB888)
         storyboard.fill(Qt.GlobalColor.black)
         signatures, timestamps = [], []
-        deadline = monotonic() + 90
+        deadline = active_scan_time(cancel) + 90
         for slot in range(SLOTS):
-            if cancel.is_set():
-                raise Cancelled()
+            check_scan(cancel)
             # Two nearby timestamps accommodate small timing/frame-rate differences.
             start = max(0, duration * (.05 + .9 * slot / (SLOTS - 1)) - .125)
-            remaining = deadline - monotonic()
+            remaining = deadline - active_scan_time(cancel)
             if remaining <= 0:
                 raise OSError("Video sampling exceeded its 90-second deadline")
             raw = run_decoder("ffmpeg", ["-v", "error", "-nostdin", "-max_alloc", "134217728",
@@ -221,8 +220,7 @@ def group_videos(videos, preset, cancel, progress=None):
     index = FingerprintIndex()
     radius = VIDEO_PRESETS[preset][0]
     for count, video in enumerate(sorted(videos, key=lambda v: (-v.width * v.height, str(v.record.path))), 1):
-        if cancel.is_set():
-            raise Cancelled()
+        check_scan(cancel)
         candidates = set()
         # A true match must share a close sampled hash with its reference. Only references are indexed.
         for signature in video.signatures:
@@ -230,8 +228,7 @@ def group_videos(videos, preset, cancel, progress=None):
                 candidates.update(i for distance, i in index.find(signature, radius, cancel))
         matches = []
         for candidate in sorted(candidates):
-            if cancel.is_set():
-                raise Cancelled()
+            check_scan(cancel)
             evidence = compare_videos(references[candidate], video, preset)
             if evidence is not None:
                 matches.append((-evidence.matched, sum(p[2] or 0 for p in evidence.pairs), candidate, evidence))

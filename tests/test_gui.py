@@ -1,17 +1,18 @@
 import os
 from dataclasses import replace
+from threading import Event
 from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QEventLoop, QSettings, Qt, QTimer
+from PySide6.QtCore import QEvent, QEventLoop, QSettings, Qt, QTimer
 from PySide6.QtGui import QDesktopServices, QFontDatabase, QPalette
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QFileDialog, QMenu, QMessageBox
 
 from duplicate_cleaner.cleanup import recycle_selected
-from duplicate_cleaner.empty_folders import (EmptyFolderRecycleResult, recycle_empty_folders,
-                                             scan_empty_folders)
+from duplicate_cleaner.duplicate_folders import (FolderGroup, inspect_tree, recycle_duplicate_folders, scan_duplicate_folders)
+from duplicate_cleaner.scanner import Reporter
 from duplicate_cleaner.gui import MainWindow, STYLE
 from duplicate_cleaner.models import Issue, RecycleResult, format_bytes
 from duplicate_cleaner.scanner import scan
@@ -20,6 +21,13 @@ from tests.support import FileTestCase
 
 
 class GuiTests(FileTestCase):
+    def test_file_size_is_visible_on_group_line_and_stays_after_selection(self):
+        group = self.window.groups[0]
+        parent = self.window.tree.topLevelItem(0)
+        self.assertEqual(parent.text(2), format_bytes(group.files[0].total_size))
+        parent.child(0).setCheckState(0, Qt.CheckState.Checked)
+        self.assertEqual(parent.text(2), format_bytes(group.files[0].total_size))
+
     def test_icon_buttons_have_accessible_action_names_in_both_themes(self):
         for dark in (True, False):
             self.window.dark_mode.setChecked(dark)
@@ -36,7 +44,7 @@ class GuiTests(FileTestCase):
             self.window.choose_excluded_folder()
             self.window.choose_excluded_folder()
         self.assertEqual(self.window.excluded_folder_paths(), (folder,))
-        for mode, scanner in (("duplicates", "scan"), ("empty", "scan_empty_folders")):
+        for mode, scanner in (("duplicates", "scan"), ("folders", "scan_duplicate_folders")):
             for key, checkbox in self.window.mode_checks.items():
                 checkbox.setChecked(key == mode)
             with patch.object(self.window, "start_job") as start:
@@ -107,7 +115,12 @@ class GuiTests(FileTestCase):
         self.addCleanup(self.window.settings.sync)
         self.window.add_folder_path(str(self.root))
         self.window.on_scan(scan([self.root]))
-        self.addCleanup(self.window.close)
+        self.addCleanup(self.dispose_window)
+
+    def dispose_window(self):
+        self.window.close()
+        self.window.deleteLater()
+        self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
     def test_switching_theme_preserves_results_checks_and_file_details(self):
         self.window.show()
@@ -692,7 +705,7 @@ class GuiTests(FileTestCase):
         selected = set(self.window.selected)
         groups = list(self.window.groups)
         self.assertEqual([self.window.workflow_tabs.tabText(i) for i in range(5)],
-                         ["Scan location", "Search criteria", "Duplicate files", "Similar files", "Empty folders"])
+                         ["Scan location", "Search criteria", "Duplicate files", "Duplicate folders", "Similar files"])
         self.assertTrue(self.window.location_page.isAncestorOf(self.window.folders))
         self.assertTrue(self.window.location_page.isAncestorOf(self.window.excluded_folders))
         self.assertFalse(self.window.folders.isVisible())
@@ -808,25 +821,21 @@ class GuiTests(FileTestCase):
         self.assertEqual(len(list(self.window.file_items())), len(self.window.records))
         self.assertFalse(self.window.selected)
 
-    def test_empty_folder_modified_column_sorts_chronologically(self):
-        from dataclasses import replace
-        from duplicate_cleaner.empty_folders import capture_empty_folder
-
-        paths = [self.root / name for name in ("earlier", "later")]
-        for path in paths:
-            path.mkdir()
-        earlier = replace(capture_empty_folder(paths[0]), modified_ns=1_600_000_000_000_000_000)
-        later = replace(capture_empty_folder(paths[1]), modified_ns=1_700_000_000_000_000_000)
-        self.window.set_empty_folders([later, earlier])
-        items = list(self.window.empty_folder_items())
-        self.window.empty_folder_tree.sortByColumn(2, Qt.SortOrder.AscendingOrder)
-        # Call directly as well: Qt can print and swallow Python comparator errors.
+    def test_duplicate_folder_size_column_sorts_numerically(self):
+        paths = [self.root / name for name in ("small", "large")]
+        self.file("small/file", b"a")
+        self.file("large/file", b"a" * 20)
+        reporter = Reporter(Event(), None)
+        folders = tuple(inspect_tree(path, reporter) for path in paths)
+        self.window.set_duplicate_folders([FolderGroup(folders[::-1])])
+        items = list(self.window.duplicate_folder_items())
+        self.window.duplicate_folder_tree.sortByColumn(2, Qt.SortOrder.AscendingOrder)
         self.assertIsInstance(items[0].__lt__(items[1]), bool)
         self.assertEqual([item.data(0, Qt.ItemDataRole.UserRole).path
-                          for item in self.window.empty_folder_items()], paths)
-        self.window.empty_folder_tree.sortByColumn(2, Qt.SortOrder.DescendingOrder)
+                          for item in self.window.duplicate_folder_items()], paths)
+        self.window.duplicate_folder_tree.sortByColumn(2, Qt.SortOrder.DescendingOrder)
         self.assertEqual([item.data(0, Qt.ItemDataRole.UserRole).path
-                          for item in self.window.empty_folder_items()], paths[::-1])
+                          for item in self.window.duplicate_folder_items()], paths[::-1])
 
     def test_cleanup_keeps_remaining_copies_and_updates_savings(self):
         original = self.window.groups[0]
@@ -1122,58 +1131,60 @@ class GuiTests(FileTestCase):
         self.assertTrue(self.window.cancel_button.isEnabled())
         # Use a real Qt event loop so the Python worker can acquire the GIL.
         loop = QEventLoop()
-        self.window.worker.finished.connect(loop.quit)
+        self.window.scan_worker.finished.connect(loop.quit)
         timeout = QTimer()
         timeout.setSingleShot(True)
         timeout.timeout.connect(loop.quit)
         timeout.start(10_000)
         loop.exec()
         timeout.stop()
-        self.assertIsNone(self.window.worker)
+        self.assertIsNone(self.window.scan_worker)
         self.assertEqual(len(self.window.groups), 1)
         self.assertTrue(self.window.scan_button.isEnabled())
         self.assertTrue(self.window.type_tabs.isEnabled())
         self.assertFalse(self.window.selected)
 
-    def test_empty_folders_have_a_separate_unchecked_full_path_tab(self):
+    def test_duplicate_folders_have_a_separate_unchecked_full_path_tab(self):
         first = self.root / "empty-one"
         second = self.root / "nested" / "empty-two"
         first.mkdir()
         second.mkdir(parents=True)
         duplicate_groups = list(self.window.groups)
-        self.window.on_empty_folder_scan(scan_empty_folders([self.root]))
+        self.window.on_duplicate_folder_scan(scan_duplicate_folders([self.root]))
 
         self.assertEqual(self.window.workflow_tabs.count(), 5)
-        self.assertEqual(self.window.workflow_tabs.tabText(3), "Similar files")
+        self.assertEqual(self.window.workflow_tabs.tabText(4), "Similar files")
         self.assertEqual(self.window.workflow_tabs.tabText(2), "Duplicate files")
-        self.assertEqual(self.window.workflow_tabs.tabText(4), "Empty folders")
-        items = list(self.window.empty_folder_items())
-        self.assertEqual({item.text(1) for item in items}, {str(first), str(second)})
+        self.assertEqual(self.window.workflow_tabs.tabText(3), "Duplicate folders")
+        items = list(self.window.duplicate_folder_items())
+        self.assertTrue({str(first), str(second)}.issubset({item.text(1) for item in items}))
         self.assertTrue(all(item.checkState(0) == Qt.CheckState.Unchecked for item in items))
-        self.assertFalse(self.window.selected_empty_folders)
+        self.assertFalse(self.window.selected_duplicate_folders)
         self.assertEqual(self.window.groups, duplicate_groups)
-        self.assertFalse(self.window.recycle_empty_folders_button.isEnabled())
+        self.assertFalse(self.window.recycle_duplicate_folders_button.isEnabled())
 
-    def test_empty_folder_checks_are_independent_from_duplicate_checks(self):
-        folder = self.root / "empty"
+    def test_duplicate_folder_checks_are_independent_from_duplicate_checks(self):
+        folder = self.root / "folders"
         folder.mkdir()
-        self.window.on_empty_folder_scan(scan_empty_folders([self.root]))
+        self.window.on_duplicate_folder_scan(scan_duplicate_folders([self.root]))
         file_item = self.window.tree.topLevelItem(0).child(0)
         file_item.setCheckState(0, Qt.CheckState.Checked)
-        folder_item = next(self.window.empty_folder_items())
+        folder_item = next(item for item in self.window.duplicate_folder_items()
+                           if item.data(0, Qt.ItemDataRole.UserRole).path == folder)
         folder_item.setCheckState(0, Qt.CheckState.Checked)
 
-        self.assertEqual(self.window.selected_empty_folders, {folder})
+        self.assertEqual(self.window.selected_duplicate_folders, {folder})
         self.assertEqual(len(self.window.selected), 1)
-        self.window.clear_empty_folder_selection()
-        self.assertFalse(self.window.selected_empty_folders)
+        self.window.clear_duplicate_folder_selection()
+        self.assertFalse(self.window.selected_duplicate_folders)
         self.assertEqual(len(self.window.selected), 1)
 
-    def test_empty_folder_confirmation_lists_paths_and_defaults_to_cancel(self):
-        folder = self.root / "empty"
+    def test_duplicate_folder_confirmation_lists_paths_and_defaults_to_cancel(self):
+        folder = self.root / "folders"
         folder.mkdir()
-        self.window.on_empty_folder_scan(scan_empty_folders([self.root]))
-        next(self.window.empty_folder_items()).setCheckState(0, Qt.CheckState.Checked)
+        self.window.on_duplicate_folder_scan(scan_duplicate_folders([self.root]))
+        next(item for item in self.window.duplicate_folder_items()
+             if item.data(0, Qt.ItemDataRole.UserRole).path == folder).setCheckState(0, Qt.CheckState.Checked)
 
         def dismiss(dialog):
             self.assertIn(str(folder), dialog.detailedText())
@@ -1183,18 +1194,18 @@ class GuiTests(FileTestCase):
 
         with patch.object(QMessageBox, "exec", dismiss), \
              patch.object(self.window, "start_job") as start:
-            self.window.confirm_empty_folder_recycle()
+            self.window.confirm_duplicate_folder_recycle()
         start.assert_not_called()
-        self.assertEqual(self.window.selected_empty_folders, {folder})
+        self.assertEqual(self.window.selected_duplicate_folders, {folder})
 
-    def test_empty_folder_cleanup_keeps_unchecked_paths_and_duplicate_results(self):
+    def test_duplicate_folder_cleanup_keeps_unchecked_paths_and_duplicate_results(self):
         selected = self.root / "empty-a"
         kept = self.root / "empty-b"
         selected.mkdir()
         kept.mkdir()
-        self.window.on_empty_folder_scan(scan_empty_folders([self.root]))
+        self.window.on_duplicate_folder_scan(scan_duplicate_folders([self.root]))
         duplicate_groups = list(self.window.groups)
-        item = next(item for item in self.window.empty_folder_items()
+        item = next(item for item in self.window.duplicate_folder_items()
                     if item.data(0, Qt.ItemDataRole.UserRole).path == selected)
         item.setCheckState(0, Qt.CheckState.Checked)
 
@@ -1202,32 +1213,33 @@ class GuiTests(FileTestCase):
             revalidate()
             path.rename(path.with_name(path.name + "-recycled"))
 
-        result = recycle_empty_folders(
-            self.window.empty_folders, self.window.selected_empty_folders, recycler=recycler)
+        result = recycle_duplicate_folders(
+            self.window.folder_groups, self.window.selected_duplicate_folders, recycler=recycler)
         with patch.object(QMessageBox, "exec", return_value=0):
-            self.window.on_empty_folders_recycled(result)
+            self.window.on_duplicate_folders_recycled(result)
 
-        self.assertEqual([record.path for record in self.window.empty_folders], [kept])
-        self.assertFalse(self.window.selected_empty_folders)
+        self.assertIn(kept, {record.path for record in self.window.duplicate_folders})
+        self.assertNotIn(selected, {record.path for record in self.window.duplicate_folders})
+        self.assertFalse(self.window.selected_duplicate_folders)
         self.assertEqual(self.window.groups, duplicate_groups)
         self.assertTrue(kept.exists())
 
-    def test_empty_folder_scan_runs_in_background_without_clearing_duplicates(self):
-        folder = self.root / "empty"
+    def test_duplicate_folder_scan_runs_in_background_without_clearing_duplicates(self):
+        folder = self.root / "folders"
         folder.mkdir()
         duplicate_groups = list(self.window.groups)
         self.window.mode_checks["duplicates"].setChecked(False)
-        self.window.mode_checks["empty"].setChecked(True)
+        self.window.mode_checks["folders"].setChecked(True)
         self.window.start_scan()
         self.assertFalse(self.window.scan_button.isEnabled())
-        self.assertFalse(self.window.empty_folder_tree.isEnabled())
+        self.assertFalse(self.window.duplicate_folder_tree.isEnabled())
         self.assertTrue(self.window.cancel_button.isEnabled())
         loop = QEventLoop()
-        self.window.worker.finished.connect(loop.quit)
+        self.window.scan_worker.finished.connect(loop.quit)
         QTimer.singleShot(10_000, loop.quit)
         loop.exec()
-        self.assertIsNone(self.window.worker)
-        self.assertEqual([record.path for record in self.window.empty_folders], [folder])
+        self.assertIsNone(self.window.scan_worker)
+        self.assertIn(folder, {record.path for record in self.window.duplicate_folders})
         self.assertEqual(self.window.groups, duplicate_groups)
         self.assertTrue(self.window.scan_button.isEnabled())
 
@@ -1261,8 +1273,8 @@ class GuiTests(FileTestCase):
             self.assertTrue(self.window.type_tabs.tabRect(self.window.type_tabs.count() - 1).right()
                             < self.window.type_tabs.width())
             self.assertTrue(self.window.grab().save(str(self.root.parent / f"gui-tabs-dark-{dark}.png")))
-        self.window.workflow_tabs.setCurrentWidget(self.window.empty_page)
+        self.window.workflow_tabs.setCurrentWidget(self.window.folder_page)
         (self.root / "Empty example folder").mkdir()
-        self.window.on_empty_folder_scan(scan_empty_folders([self.root]))
+        self.window.on_duplicate_folder_scan(scan_duplicate_folders([self.root]))
         QTest.qWait(20)
         self.assertTrue(self.window.grab().save(str(self.root.parent / "gui-empty-folders.png")))

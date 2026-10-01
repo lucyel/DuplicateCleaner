@@ -5,7 +5,7 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QSettings, Qt
+from PySide6.QtCore import QEvent, QSettings, Qt
 from PySide6.QtGui import QCloseEvent, QFontDatabase
 from PySide6.QtWidgets import QApplication
 
@@ -27,26 +27,26 @@ class SimilarTabTests(FileTestCase):
         for checkbox in self.window.mode_checks.values():
             self.assertTrue(self.window.criteria_page.isAncestorOf(checkbox))
             checkbox.setChecked(True)
-        empty = self.root / "old" / "empty"
+        empty = self.root / "old" / "folders"
         empty.mkdir()
         self.window.start_scan()
         self.assertFalse(self.window.criteria_page.isEnabled())
         self.assertFalse(self.window.folders.isEnabled())
-        self.wait_for(lambda: self.window.worker is None, seconds=20)
+        self.wait_for(lambda: self.window.scan_worker is None, seconds=20)
         self.assertEqual(len(self.window.groups), 1)
         self.assertEqual(len(self.tab.result.groups), 1)
-        self.assertEqual([record.path for record in self.window.empty_folders], [empty])
+        self.assertEqual([record.path for record in self.window.duplicate_folders], [empty])
         self.assertIn("Similar files: 1 groups", self.window.status.text())
         similarity = self.tab.result
-        folders = list(self.window.empty_folders)
+        folders = list(self.window.duplicate_folders)
         self.window.mode_checks["similarity"].setChecked(False)
-        self.window.mode_checks["empty"].setChecked(False)
+        self.window.mode_checks["folders"].setChecked(False)
         self.window.file_type_checks["Documents"].setChecked(True)
         self.window.start_scan()
-        self.wait_for(lambda: self.window.worker is None)
+        self.wait_for(lambda: self.window.scan_worker is None)
         self.assertEqual(self.window.scan_file_count, 2)
         self.assertIs(self.tab.result, similarity)
-        self.assertEqual(self.window.empty_folders, folders)
+        self.assertEqual(self.window.duplicate_folders, folders)
 
     def test_file_type_selection_all_multiple_and_none(self):
         self.assertIsNone(self.window.selected_file_types())
@@ -62,12 +62,12 @@ class SimilarTabTests(FileTestCase):
             self.window.start_scan()
         start.assert_not_called()
         self.window.mode_checks["similarity"].setChecked(False)
-        self.window.mode_checks["empty"].setChecked(True)
+        self.window.mode_checks["folders"].setChecked(True)
         for checkbox in self.window.criteria_checks.values():
             checkbox.setChecked(False)
         self.assertTrue(self.window.scan_button.isEnabled())
         self.assertFalse(self.window.file_types_box.isEnabled())
-        self.window.mode_checks["empty"].setChecked(False)
+        self.window.mode_checks["folders"].setChecked(False)
         self.assertFalse(self.window.scan_button.isEnabled())
 
     def test_scan_uses_a_snapshot_of_shared_settings(self):
@@ -94,7 +94,7 @@ class SimilarTabTests(FileTestCase):
         self.window.add_folder_path(str(self.images))
         self.assertTrue(self.window.all_file_types.isChecked())
         self.window.start_scan()
-        self.wait_for(lambda: self.window.worker is None, seconds=30)
+        self.wait_for(lambda: self.window.scan_worker is None, seconds=30)
         self.assertEqual((self.tab.result.image_count, self.tab.result.video_count), (2, 2))
         self.assertEqual(len(self.tab.result.groups), 2, self.tab.result.issues)
         video_group = self.tab.tree.topLevelItem(1)
@@ -118,7 +118,7 @@ class SimilarTabTests(FileTestCase):
 
         self.window.file_type_checks["Videos"].setChecked(True)
         self.window.start_scan()
-        self.wait_for(lambda: self.window.worker is None, seconds=30)
+        self.wait_for(lambda: self.window.scan_worker is None, seconds=30)
         self.assertEqual(self.tab.result.image_count, 0)
         self.assertEqual(self.tab.result.videos_compared, 2)
         self.assertEqual(self.old_state(), before)
@@ -142,7 +142,7 @@ class SimilarTabTests(FileTestCase):
         settings.start()
         self.addCleanup(settings.stop)
         self.window = MainWindow()
-        self.addCleanup(self.window.close)
+        self.addCleanup(self.dispose_window)
         self.addCleanup(self.stop_worker)
         self.tab = self.window.similar_tab
         self.images = self.root / "images"
@@ -162,6 +162,11 @@ class SimilarTabTests(FileTestCase):
         self.window.workflow_tabs.setCurrentWidget(self.tab)
         self.app.processEvents()
 
+    def dispose_window(self):
+        self.window.close()
+        self.window.deleteLater()
+        self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
     def wait_for(self, condition, seconds=10):
         deadline = monotonic() + seconds
         while not condition() and monotonic() < deadline:
@@ -171,9 +176,9 @@ class SimilarTabTests(FileTestCase):
         self.assertTrue(condition(), "Timed out waiting for the UI")
 
     def stop_worker(self):
-        if self.window.worker is not None:
+        if self.window.scan_worker is not None:
             self.window.cancel_work()
-            self.wait_for(lambda: self.window.worker is None)
+            self.wait_for(lambda: self.window.scan_worker is None)
 
     def old_state(self):
         window = self.window
@@ -194,9 +199,9 @@ class SimilarTabTests(FileTestCase):
         self.window.add_folder_path(str(self.images))  # Repeated choices do not duplicate roots.
         self.assertEqual(self.window.folders.count(), 2)
         self.window.scan_button.click()
-        self.assertIsNotNone(self.window.worker)
+        self.assertIsNotNone(self.window.scan_worker)
         self.assertFalse(self.window.scan_button.isEnabled())
-        self.wait_for(lambda: self.window.worker is None)
+        self.wait_for(lambda: self.window.scan_worker is None)
         self.assertEqual(len(self.tab.result.groups), 1, self.tab.status.text())
         self.assertEqual(self.old_state(), before)
 
@@ -237,7 +242,7 @@ class SimilarTabTests(FileTestCase):
             self.window.start_scan()
             self.wait_for(started.is_set)
             self.window.cancel_button.click()
-            self.wait_for(lambda: self.window.worker is None)
+            self.wait_for(lambda: self.window.scan_worker is None)
         self.assertTrue(self.tab.result.cancelled)
         self.assertFalse(self.tab.result.groups)
         self.assertIn("cancelled", self.tab.summary.text())
@@ -248,7 +253,7 @@ class SimilarTabTests(FileTestCase):
         with patch("duplicate_cleaner.scan_workflow.scan_similar", side_effect=OSError("Read failed")):
             self.window.add_folder_path(str(self.images))
             self.window.start_scan()
-            self.wait_for(lambda: self.window.worker is None)
+            self.wait_for(lambda: self.window.scan_worker is None)
         self.assertTrue(self.window.scan_button.isEnabled())
         self.assertFalse(self.window.cancel_button.isEnabled())
         self.assertIn("Read failed", self.tab.status.text())
@@ -262,8 +267,8 @@ class SimilarTabTests(FileTestCase):
             event = QCloseEvent()
             self.window.closeEvent(event)
             self.assertFalse(event.isAccepted())
-            self.assertTrue(self.window.worker.cancel_event.is_set())
-            self.wait_for(lambda: self.window.worker is None)
+            self.assertTrue(self.window.scan_worker.cancel_event.is_set())
+            self.wait_for(lambda: self.window.scan_worker is None)
         event = QCloseEvent()
         self.window.closeEvent(event)
         self.assertTrue(event.isAccepted())

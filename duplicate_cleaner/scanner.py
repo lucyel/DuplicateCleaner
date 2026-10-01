@@ -10,7 +10,8 @@ from typing import BinaryIO, Callable, Iterable
 from .files import capture, check_attributes, check_location, ensure_current, open_checked, open_named_streams, UnsafeFile
 from .file_types import accepts_file, validate_file_types
 from .matching import candidate_key, compatible
-from .models import Cancelled, DuplicateGroup, FileRecord, Issue, Progress, ScanResult, SearchCriteria
+from .models import Cancelled, DuplicateGroup, FileRecord, IndexedFile, Issue, Progress, ScanResult, SearchCriteria
+from .scan_control import check_scan
 
 CHUNK_SIZE = 1024 * 1024
 SAMPLE_SIZE = 64 * 1024
@@ -28,8 +29,7 @@ class Reporter:
         self.path = ""
 
     def check(self) -> None:
-        if self.cancel.is_set():
-            raise Cancelled()
+        check_scan(self.cancel)
 
     def emit(self, force: bool = False) -> None:
         self.check()
@@ -134,26 +134,45 @@ def scan(roots: Iterable[Path | str], recursive: bool = True, *,
          criteria: SearchCriteria = SearchCriteria(),
          file_types: Iterable[str] | None = None,
          cancel: Event | None = None,
-         progress: Callable[[Progress], None] | None = None) -> ScanResult:
+         progress: Callable[[Progress], None] | None = None,
+         previous: ScanResult | None = None) -> ScanResult:
     if not criteria.enabled:
         raise ValueError("Choose at least one search criterion")
     if criteria.size_tolerance < 0 or criteria.text_tolerance < 0 or criteria.folder_depth < 1:
         raise ValueError("Tolerances must be nonnegative and folder depth must be positive")
     result = ScanResult()
+    if previous is not None:
+        result.index = dict(previous.index)
+        result.issues = list(previous.issues)
+        result.file_count, result.total_bytes = previous.file_count, previous.total_bytes
     file_types = validate_file_types(file_types)
     reporter = Reporter(cancel if cancel is not None else Event(), progress)
     by_match: dict[tuple, list[FileRecord]] = defaultdict(list)
     seen_dirs: set[tuple[int, int]] = set()
     seen_files: set[tuple[int, int]] = set()
+    if previous is not None:
+        seen_files.update((item.record.device, item.record.inode) for item in previous.index.values())
+        for item in previous.index.values():
+            by_match[item.key].append(item.record)
+    old_paths = set(result.index)
+    next_byte_class = max((item.byte_class for item in result.index.values() if item.byte_class is not None), default=-1) + 1
     scan_roots = sorted({Path(os.path.abspath(root)) for root in roots},
                         key=lambda path: (-len(path.parts), str(path).casefold()))
     stack = list(scan_roots)
+    result.roots = tuple(sorted(set(scan_roots) | set(previous.roots if previous else ())))
+    search_roots = sorted(result.roots, key=lambda path: (-len(path.parts), str(path).casefold()))
+    new_keys = set()
     exclusions = {Path(os.path.abspath(path)) for path in excluded_folders}
+    result.settings = (recursive, frozenset(exclusions), criteria, file_types)
+    if previous is not None and previous.settings != result.settings:
+        raise ValueError("Scan settings changed; run a fresh scan before scanning added folders")
     try:
         reporter.emit(True)
         while stack:
             folder = stack.pop()
             reporter.check()
+            if previous and any(folder == root or (recursive and root in folder.parents) for root in previous.roots):
+                continue
             # Also honor exclusions when an overlapping root was explicitly added.
             if folder in exclusions or exclusions.intersection(folder.parents):
                 continue
@@ -192,10 +211,12 @@ def scan(roots: Iterable[Path | str], recursive: bool = True, *,
                                 continue
                             seen_files.add(identity)
                             # Overlapping roots always use the most specific configured root.
-                            root = (next(root for root in scan_roots if record.path.is_relative_to(root))
+                            root = (next(root for root in search_roots if record.path.is_relative_to(root))
                                     if criteria.folder and criteria.from_search_root else folder)
                             key = candidate_key(record, root, entry_info, criteria)
                             by_match[key].append(record)
+                            result.index[record.path] = IndexedFile(record, key)
+                            new_keys.add(key)
                             result.file_count += 1
                             result.total_bytes += record.total_size
                             reporter.completed = result.file_count
@@ -205,7 +226,11 @@ def scan(roots: Iterable[Path | str], recursive: bool = True, *,
             except OSError as exc:
                 result.issues.append(Issue(folder, str(exc)))
 
-        candidates = [files for files in by_match.values() if len(files) > 1]
+        candidates = [files for key, files in by_match.items() if len(files) > 1
+                      and (previous is None or key in new_keys)]
+        if previous:
+            result.groups = [group for group in previous.groups
+                             if result.index[group.files[0].path].key not in new_keys]
         # Discovery-only indexes otherwise retain every unique file until the scan ends.
         by_match.clear()
         seen_dirs.clear()
@@ -224,12 +249,20 @@ def scan(roots: Iterable[Path | str], recursive: bool = True, *,
                 for record in files:
                     reporter.path = str(record.path)
                     try:
-                        digest = digest_function(record, reporter)
+                        indexed = result.index[record.path]
+                        cached = indexed.sample if stage == "Comparing samples" else indexed.digest
+                        if cached is not None:
+                            ensure_current(record)
+                        digest = cached if cached is not None else digest_function(record, reporter)
                         if stage == "Hashing full contents" and record.streams:
-                            record = replace(record, stream_hashes=hash_named_streams(record, reporter))
+                            if not record.stream_hashes:
+                                record = replace(record, stream_hashes=hash_named_streams(record, reporter))
+                        result.index[record.path] = replace(indexed, record=record, **{
+                            "sample" if stage == "Comparing samples" else "digest": digest})
                         buckets[digest].append(record)
                     except OSError as exc:
                         result.issues.append(Issue(record.path, str(exc)))
+                        result.index.pop(record.path, None)
                     reporter.completed += 1
                     reporter.emit()
                 for digest, bucket in buckets.items():
@@ -246,11 +279,14 @@ def scan(roots: Iterable[Path | str], recursive: bool = True, *,
             verified: list[list[FileRecord]] = []
             try:
                 for record in sorted(files, key=lambda item: (
-                        item.size if criteria.size and criteria.size_tolerance else 0, str(item.path).casefold())):
+                        item.size if criteria.size and criteria.size_tolerance else 0,
+                        item.path not in old_paths, str(item.path).casefold())):
                     reporter.path = str(record.path)
                     reporter.check()
                     if record.streams and not criteria.hashes and (criteria.contents or criteria.streams):
-                        record = replace(record, stream_hashes=hash_named_streams(record, reporter))
+                        if not record.stream_hashes:
+                            record = replace(record, stream_hashes=hash_named_streams(record, reporter))
+                            result.index[record.path] = replace(result.index[record.path], record=record)
                     for bucket in verified:
                         if criteria.streams and (record.streams, record.stream_hashes) != (
                                 bucket[0].streams, bucket[0].stream_hashes):
@@ -259,16 +295,29 @@ def scan(roots: Iterable[Path | str], recursive: bool = True, *,
                         matches = not criteria.size or record.size - bucket[0].size <= criteria.size_tolerance
                         if matches and criteria.similar_names:
                             # Every pair must meet tolerances; do not chain loose matches.
-                            for previous in bucket:
+                            for other in bucket:
                                 reporter.check()
-                                if not compatible(previous, record, criteria):
+                                if not compatible(other, record, criteria):
                                     matches = False
                                     break
-                        if matches and (not criteria.contents or identical(bucket[0], record, reporter)):
+                        first_class, second_class = result.index[bucket[0].path].byte_class, result.index[record.path].byte_class
+                        # Similar-name partitions can split equal contents without reading
+                        # them. After cleanup changes the representatives, different class
+                        # IDs therefore need a byte comparison under those criteria.
+                        known_pair = (first_class is not None and second_class is not None
+                                      and (not criteria.similar_names or first_class == second_class))
+                        same_bytes = (first_class == second_class if known_pair else
+                                      identical(bucket[0], record, reporter) if matches and criteria.contents else True)
+                        if matches and (not criteria.contents or same_bytes):
                             bucket.append(record)
+                            if criteria.contents:
+                                result.index[record.path] = replace(result.index[record.path], byte_class=first_class)
                             break
                     else:
                         verified.append([record])
+                        if criteria.contents and result.index[record.path].byte_class is None:
+                            result.index[record.path] = replace(result.index[record.path], byte_class=next_byte_class)
+                            next_byte_class += 1
                     reporter.completed += 1
                     reporter.emit()
                 for record in files:
@@ -284,6 +333,8 @@ def scan(roots: Iterable[Path | str], recursive: bool = True, *,
             except OSError as exc:
                 for record in files:
                     result.issues.append(Issue(record.path, f"Group could not be verified: {exc}"))
+                    # Do not keep a potentially stale member in the next extension's index.
+                    result.index.pop(record.path, None)
         result.groups.sort(key=lambda group: group.extra_bytes, reverse=True)
         reporter.stage = "Scan complete"
         reporter.completed = reporter.total

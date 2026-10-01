@@ -16,6 +16,7 @@ from PySide6.QtGui import QImage, QImageReader, QPainter
 
 from .files import capture, check_attributes, check_location, ensure_current, open_checked
 from .file_types import accepts_file, validate_file_types
+from .scan_control import check_scan
 from .models import Cancelled, FileRecord, Issue, Progress
 from .thumbnails import _binary_pipe
 from .video_similarity import VIDEO_SUFFIXES, VideoGroup, group_videos, read_video_fingerprint
@@ -48,6 +49,10 @@ class SimilarResult:
     cancelled: bool = False
     video_count: int = 0
     videos_compared: int = 0
+    images: tuple[ImageFingerprint, ...] = field(default=(), repr=False)
+    videos: tuple = field(default=(), repr=False)
+    roots: tuple[Path, ...] = ()
+    settings: tuple = field(default=(), repr=False)
 
 
 def fingerprint_image(record: FileRecord) -> ImageFingerprint:
@@ -113,6 +118,7 @@ def fingerprint_main():
 
 
 def read_fingerprint(record, cancel, timeout=10):
+    check_scan(cancel)
     executable = Path(sys.executable)
     arguments = ["--image-fingerprint"]
     if not getattr(sys, "frozen", False):
@@ -182,8 +188,7 @@ class FingerprintIndex:
         stack = [self.root] if self.root is not None else []
         matches = []
         while stack:
-            if cancel.is_set():
-                raise Cancelled()
+            check_scan(cancel)
             value, indices, children = stack.pop()
             distance = (signature ^ value).bit_count()
             if distance <= radius:
@@ -198,8 +203,7 @@ def group_images(images, radius, cancel, progress=None):
     # Prefer a larger image as the stable reference. Members never become extra reference links.
     images = sorted(images, key=lambda item: (-item.width * item.height, str(item.record.path).casefold()))
     for count, image in enumerate(images, 1):
-        if cancel.is_set():
-            raise Cancelled()
+        check_scan(cancel)
         for distance, candidate in index.find(image.signature, radius, cancel):
             reference = references[candidate]
             aspect_ratio = image.width * reference.height / (image.height * reference.width)
@@ -217,7 +221,7 @@ def group_images(images, radius, cancel, progress=None):
 
 
 def scan_similar(roots, recursive=True, *, excluded_folders=(), preset="Balanced", cancel=None, progress=None,
-                 media_kind="Images", file_types=None):
+                 media_kind="Images", file_types=None, previous=None):
     if preset not in PRESETS:
         raise ValueError("Choose Strict, Balanced, or Broad similarity")
     if media_kind not in ("All", "Images", "Videos"):
@@ -225,29 +229,37 @@ def scan_similar(roots, recursive=True, *, excluded_folders=(), preset="Balanced
     suffixes = (IMAGE_SUFFIXES if media_kind != "Videos" else set()) | (VIDEO_SUFFIXES if media_kind != "Images" else set())
     cancel = cancel if cancel is not None else Event()
     result = SimilarResult()
+    if previous is not None:
+        result.issues = list(previous.issues)
+        result.ignored_count = previous.ignored_count
     file_types = validate_file_types(file_types)
     exclusions = {Path(os.path.abspath(path)) for path in excluded_folders}
+    result.settings = (recursive, frozenset(exclusions), preset, media_kind, file_types)
+    if previous is not None and previous.settings != result.settings:
+        raise ValueError("Scan settings changed; run a fresh scan before scanning added folders")
     stack = [Path(os.path.abspath(path)) for path in roots]
+    result.roots = tuple(sorted(set(stack) | set(previous.roots if previous else ())))
     seen_dirs, seen_files, records = set(), set(), []
+    if previous:
+        seen_files.update((item.record.device, item.record.inode) for item in (*previous.images, *previous.videos))
     last_report = 0.0
 
     def report(stage, completed, total=0, path="", force=False):
         nonlocal last_report
-        if cancel.is_set():
-            raise Cancelled()
+        check_scan(cancel)
         now = monotonic()
         if progress and (force or now - last_report >= 0.1):
             progress(Progress(stage, completed, total, str(path)))
             last_report = now
-            if cancel.is_set():
-                raise Cancelled()
+            check_scan(cancel)
 
     try:
         report("Finding supported media", 0, force=True)
         while stack:
-            if cancel.is_set():
-                raise Cancelled()
+            check_scan(cancel)
             folder = stack.pop()
+            if previous and any(folder == root or (recursive and root in folder.parents) for root in previous.roots):
+                continue
             if folder in exclusions or exclusions.intersection(folder.parents):
                 continue
             try:
@@ -261,8 +273,7 @@ def scan_similar(roots, recursive=True, *, excluded_folders=(), preset="Balanced
                 seen_dirs.add(identity)
                 with os.scandir(folder) as entries:
                     for entry in entries:
-                        if cancel.is_set():
-                            raise Cancelled()
+                        check_scan(cancel)
                         path = Path(entry.path)
                         if path in exclusions:
                             continue
@@ -288,9 +299,10 @@ def scan_similar(roots, recursive=True, *, excluded_folders=(), preset="Balanced
                         report("Finding supported media", len(records), path=path)
             except OSError as exc:
                 result.issues.append(Issue(folder, str(exc)))
-        result.video_count = sum(record.path.suffix.casefold() in VIDEO_SUFFIXES for record in records)
-        result.image_count = len(records) - result.video_count
-        images, videos = [], []
+        new_videos = sum(record.path.suffix.casefold() in VIDEO_SUFFIXES for record in records)
+        result.video_count = new_videos + (previous.video_count if previous else 0)
+        result.image_count = len(records) - new_videos + (previous.image_count if previous else 0)
+        images, videos = list(previous.images if previous else ()), list(previous.videos if previous else ())
         for count, record in enumerate(records, 1):
             report("Reading visual fingerprints", count - 1, len(records), record.path, force=True)
             try:
@@ -305,24 +317,28 @@ def scan_similar(roots, recursive=True, *, excluded_folders=(), preset="Balanced
         report("Comparing visual fingerprints", 0, len(images), force=True)
         groups = group_images(images, PRESETS[preset], cancel, progress)
         groups.extend(group_videos(videos, preset, cancel, progress))
+        invalid = set()
         for count, group in enumerate(groups, 1):
             report("Checking results", count, len(groups), force=count == 1)
             try:
                 ensure_current(group.reference.record)
             except OSError as exc:
                 result.issues.append(Issue(group.reference.record.path, str(exc)))
+                invalid.add(group.reference.record.path)
                 continue
             matches = []
             for image, distance in group.matches:
-                if cancel.is_set():
-                    raise Cancelled()
+                check_scan(cancel)
                 try:
                     ensure_current(image.record)
                     matches.append((image, distance))
                 except OSError as exc:
                     result.issues.append(Issue(image.record.path, str(exc)))
+                    invalid.add(image.record.path)
             if matches:
                 result.groups.append(type(group)(group.reference, tuple(matches)))
+        result.images = tuple(image for image in images if image.record.path not in invalid)
+        result.videos = tuple(video for video in videos if video.record.path not in invalid)
         report("Similarity scan complete", result.compared_count, result.compared_count, force=True)
     except Cancelled:
         result.cancelled = True

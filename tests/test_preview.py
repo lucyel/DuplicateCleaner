@@ -10,13 +10,14 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QPoint, QPointF, QProcess, QSettings, Qt
+from PySide6.QtCore import QEvent, QPoint, QPointF, QProcess, QSettings, Qt
 from PySide6.QtGui import QColor, QFontDatabase, QImage, QPainter, QPolygon, QWheelEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from duplicate_cleaner.files import capture
 from duplicate_cleaner.gui import MainWindow
+from duplicate_cleaner.models import format_bytes
 from duplicate_cleaner.preview import GroupGallery, render_preview
 from duplicate_cleaner.scanner import scan
 from tests.support import FileTestCase
@@ -55,10 +56,15 @@ class PreviewTests(FileTestCase):
         self.addCleanup(settings.stop)
         self.window = MainWindow()
         self.window.workflow_tabs.setCurrentWidget(self.window.duplicate_page)
-        self.addCleanup(self.window.close)
+        self.addCleanup(self.dispose_window)
         self.window.add_folder_path(str(first.parent))
         self.window.on_scan(scan([self.root]))
         self.preview = self.window.comparison_preview
+
+    def dispose_window(self):
+        self.window.close()
+        self.window.deleteLater()
+        self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
     def wait_until(self, condition):
         deadline = monotonic() + 12
@@ -245,7 +251,7 @@ class PreviewTests(FileTestCase):
         self.assertFalse(self.preview.files)
         self.window.preview_toggle.click()
         self.assertTrue(self.preview.files)
-        self.window.workflow_tabs.setCurrentWidget(self.window.empty_page)
+        self.window.workflow_tabs.setCurrentWidget(self.window.folder_page)
         self.assertFalse(self.preview.files)
         self.window.workflow_tabs.setCurrentWidget(self.window.duplicate_page)
         self.assertTrue(self.preview.files)
@@ -362,7 +368,7 @@ class PreviewTests(FileTestCase):
                 if preview_size:
                     self.assertLessEqual(max(image.width(), image.height()), preview_size)
 
-    def test_group_gallery_loads_all_visible_files_and_removes_group_labels(self):
+    def test_group_gallery_loads_all_visible_files_and_preserves_group_file_size(self):
         self.window.resize(1500, 1000)
         self.window.show()
         group = self.select_file(group_row=True)
@@ -370,9 +376,10 @@ class PreviewTests(FileTestCase):
         self.wait_until(lambda: bool(gallery.visible) and all(
             gallery.item(i).icon().cacheKey() != gallery.file_icon.cacheKey() for i in gallery.visible))
         self.assertEqual(gallery.count(), 3)
-        self.assertEqual([group.text(column) for column in (1, 2, 3)], ["", "", ""])
+        expected_size = format_bytes(self.window.groups[0].files[0].total_size)
+        self.assertEqual([group.text(column) for column in (1, 2, 3)], ["", expected_size, ""])
         self.window.filter_results()
-        self.assertEqual([group.text(column) for column in (1, 2, 3)], ["", "", ""])
+        self.assertEqual([group.text(column) for column in (1, 2, 3)], ["", expected_size, ""])
         group.child(0).setCheckState(0, Qt.CheckState.Checked)
         checked = group.child(0).data(0, Qt.ItemDataRole.UserRole)
         index = gallery.files.index(checked)

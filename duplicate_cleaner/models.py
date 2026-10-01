@@ -51,6 +51,15 @@ class FileRecord:
 
 
 @dataclass(frozen=True)
+class IndexedFile:
+    record: FileRecord
+    key: tuple
+    sample: bytes | None = None
+    digest: bytes | None = None
+    byte_class: int | None = None
+
+
+@dataclass(frozen=True)
 class DuplicateGroup:
     files: tuple[FileRecord, ...]
     # None means no main-file hash was calculated (metadata-only or byte-only scanning).
@@ -126,6 +135,10 @@ class ScanResult:
     file_count: int = 0
     total_bytes: int = 0
     cancelled: bool = False
+    # In-memory inventory, including unmatched files. Saved sessions omit it.
+    index: dict[Path, IndexedFile] = field(default_factory=dict, repr=False)
+    roots: tuple[Path, ...] = ()
+    settings: tuple = field(default=(), repr=False)
 
 
 @dataclass(frozen=True)
