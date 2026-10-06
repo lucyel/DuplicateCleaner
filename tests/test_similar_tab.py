@@ -7,9 +7,10 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QEvent, QSettings, Qt
 from PySide6.QtGui import QCloseEvent, QFontDatabase
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMenu, QMessageBox
 
 from duplicate_cleaner.gui import MainWindow
+from duplicate_cleaner.cleanup import recycle_reviewed_files
 from duplicate_cleaner.scanner import scan
 from duplicate_cleaner.similarity import SimilarResult, scan_similar
 from tests.support import FileTestCase
@@ -18,6 +19,150 @@ from tests.test_video_similarity import make_video
 
 
 class SimilarTabTests(FileTestCase):
+    def test_tree_gallery_and_image_preview_checks_stay_synchronized(self):
+        self.tab.on_result(scan_similar([self.images]))
+        self.assertFalse(self.tab.selected)
+        group = self.tab.tree.topLevelItem(0)
+        self.tab.tree.setCurrentItem(group)
+        first = group.child(0).data(0, Qt.ItemDataRole.UserRole)[1].record.path
+        group.child(0).setCheckState(0, Qt.CheckState.Checked)
+        self.assertEqual(self.tab.selected, {first})
+        self.assertIn("1 file selected", self.tab.selection_label.text())
+        self.assertEqual(self.tab.gallery.item(0).checkState(), Qt.CheckState.Checked)
+        self.tab.gallery.item(1).setCheckState(Qt.CheckState.Checked)
+        self.assertEqual(group.child(1).checkState(0), Qt.CheckState.Checked)
+        self.tab.tree.setCurrentItem(group.child(1))
+        self.assertTrue(all(pane.recycle_check.isChecked() for pane in self.tab.panes))
+        self.tab.panes[0].recycle_check.setChecked(False)
+        self.assertNotIn(first, self.tab.selected)
+        self.assertEqual(group.child(0).checkState(0), Qt.CheckState.Unchecked)
+        self.tab.clear_button.click()
+        self.assertFalse(self.tab.selected)
+        self.assertFalse(self.tab.recycle_button.isEnabled())
+        self.assertTrue(all(not pane.recycle_check.isChecked() for pane in self.tab.panes))
+
+    def test_group_and_item_menus_match_duplicate_actions(self):
+        before = self.old_state()
+        self.tab.on_result(scan_similar([self.images]))
+        parent = self.tab.tree.topLevelItem(0)
+        menu = QMenu(self.tab)
+        with patch("duplicate_cleaner.similar_tab.QMenu", return_value=menu), \
+                patch.object(menu, "exec", side_effect=lambda position: menu.actions()[-1].trigger()):
+            self.tab.show_result_menu(self.tab.tree.visualItemRect(parent).center())
+        self.assertEqual(self.tab.selected, set(self.tab.records))
+        self.tab.clear_selection()
+        menu = QMenu(self.tab)
+        def select_folder(position):
+            self.assertEqual([action.text() for action in menu.actions() if not action.isSeparator()],
+                             ["Open file location", "Select this folder's similar files (keep one file)",
+                              "Select all items in this group"])
+            menu.actions()[2].trigger()
+        with patch("duplicate_cleaner.similar_tab.QMenu", return_value=menu), \
+                patch.object(menu, "exec", side_effect=select_folder):
+            self.tab.show_result_menu(self.tab.tree.visualItemRect(parent.child(1)).center())
+        self.assertEqual(len(self.tab.selected), 1)
+        selected = set(self.tab.selected)
+        self.tab.select_folder(parent.child(1).data(0, Qt.ItemDataRole.UserRole)[1])
+        self.assertEqual(self.tab.selected, selected)
+        self.tab.tree.setCurrentItem(parent)
+        gallery_menu = QMenu(self.tab)
+        with patch("duplicate_cleaner.similar_tab.QMenu", return_value=gallery_menu), \
+                patch.object(gallery_menu, "exec", side_effect=lambda position: gallery_menu.actions()[0].trigger()), \
+                patch("duplicate_cleaner.gui.QDesktopServices.openUrl", return_value=True) as opened:
+            self.tab.show_gallery_menu(self.tab.gallery.visualItemRect(self.tab.gallery.item(0)).center())
+        self.assertEqual(opened.call_args.args[0].toLocalFile().replace("/", "\\"), str(self.images))
+        self.assertEqual(self.tab.selected, selected)
+        self.assertEqual(self.old_state(), before)
+
+    def test_busy_similar_results_reject_every_selection_path(self):
+        self.tab.on_result(scan_similar([self.images]))
+        parent = self.tab.tree.topLevelItem(0)
+        group, image = parent.child(0).data(0, Qt.ItemDataRole.UserRole)
+        self.tab.tree.setCurrentItem(parent)
+        self.tab.set_busy(True)
+        self.tab.set_checked(image.record.path, True)
+        self.tab.select_group(group)
+        self.tab.select_folder(image)
+        parent.child(0).setCheckState(0, Qt.CheckState.Checked)
+        self.tab.gallery.item(0).setCheckState(Qt.CheckState.Checked)
+        self.assertFalse(self.tab.selected)
+        self.assertEqual(parent.child(0).checkState(0), Qt.CheckState.Unchecked)
+        self.assertFalse(self.tab.gallery.isEnabled())
+        self.assertFalse(self.tab.recycle_button.isEnabled())
+
+    def test_similar_cleanup_confirmation_and_partial_result_are_independent(self):
+        before = self.old_state()
+        self.tab.on_result(scan_similar([self.images]))
+        group = self.tab.result.groups[0]
+        selected = group.matches[0][0].record.path
+        self.tab.set_checked(selected, True)
+        dialogs = []
+        def accept(dialog):
+            dialogs.append(dialog)
+            self.assertEqual(dialog.defaultButton().text(), "Cancel")
+            self.assertIn("may contain different content", dialog.informativeText())
+            self.assertIn("does not compare audio", dialog.informativeText())
+            self.assertIn(str(selected), dialog.detailedText())
+            next(button for button in dialog.buttons() if button.text() == "Recycle selected files").click()
+            return 0
+        with patch.object(QMessageBox, "exec", accept), patch.object(self.window, "start_job") as start:
+            self.tab.recycle_button.click()
+        job, handler = start.call_args.args[:2]
+        def recycler(path, revalidate):
+            revalidate()
+            path.rename(self.root / "reviewed-fixture.jpg")
+        with patch("duplicate_cleaner.gui.recycle_reviewed_files", side_effect=lambda *args, **kwargs:
+                   recycle_reviewed_files(*args, recycler=recycler, **kwargs)):
+            outcome = job()
+        self.assertEqual(outcome.recycled, [selected])
+        with patch.object(QMessageBox, "exec", return_value=0):
+            handler(outcome)
+        self.assertFalse(self.tab.selected)
+        self.assertFalse(self.tab.result.groups)
+        self.assertNotIn(selected, {image.record.path for image in self.tab.result.images})
+        self.assertEqual(self.old_state(), before)
+        self.assertTrue(group.reference.record.path.exists())
+
+    def test_recycling_reference_drops_group_but_retains_unmatched_survivors(self):
+        self.tab.on_result(scan_similar([self.images]))
+        group = self.tab.result.groups[0]
+        reference = group.reference.record.path
+        self.tab.select_group(group)
+        outcome = recycle_reviewed_files(self.tab.records.values(), [reference],
+            recycler=lambda path, check: (check(), path.rename(self.root / "reviewed-reference.png")))
+        with patch.object(QMessageBox, "exec", return_value=0):
+            self.window.on_similar_recycled(outcome)
+        self.assertFalse(self.tab.result.groups)
+        self.assertEqual({image.record.path for image in self.tab.result.images}, {group.matches[0][0].record.path})
+        self.assertFalse(self.tab.selected)
+
+    def test_all_selected_warning_and_cancel_do_not_start_cleanup(self):
+        self.tab.on_result(scan_similar([self.images]))
+        self.tab.select_group(self.tab.result.groups[0])
+        def cancel(dialog):
+            self.assertIn("All files selected", dialog.informativeText())
+            self.assertIn("No listed file will remain", dialog.informativeText())
+            self.assertEqual(dialog.defaultButton().text(), "Cancel")
+            return 0
+        with patch.object(QMessageBox, "exec", cancel), patch.object(self.window, "start_job") as start:
+            self.window.confirm_similar_recycle()
+        start.assert_not_called()
+        self.assertEqual(self.tab.selected, set(self.tab.records))
+
+    def test_unexpected_cleanup_failure_invalidates_cache_and_clears_checks(self):
+        self.tab.on_result(scan_similar([self.images]))
+        self.tab.select_group(self.tab.result.groups[0])
+        self.window._scan_baselines = {"similarity": self.tab.result}
+        self.window._baseline_settings = self.window.current_scan_settings()
+        self.tab.set_busy(True)
+        with patch.object(QMessageBox, "critical") as message:
+            self.window.on_similar_recycle_failure("Unexpected failure")
+        self.assertFalse(self.window._scan_baselines)
+        self.assertIsNone(self.window._baseline_settings)
+        self.assertFalse(self.tab.selected)
+        self.assertIn("check the Recycle Bin", self.tab.status.text())
+        message.assert_called_once()
+
     def test_shared_locations_modes_and_types_drive_all_three_results(self):
         self.assertIs(self.window.workflow_tabs.widget(0), self.window.location_page)
         self.assertTrue(self.window.location_page.isAncestorOf(self.window.folders))
@@ -106,6 +251,15 @@ class SimilarTabTests(FileTestCase):
         self.tab.tree.setCurrentItem(video_group.child(1))
         self.assertIs(self.tab.stack.currentWidget(), self.tab.video_review)
         self.assertEqual(self.tab.video_review.samples.count(), 12)
+        video_path = video_group.child(1).data(0, Qt.ItemDataRole.UserRole)[1].record.path
+        self.tab.video_review.checks[1].setChecked(True)
+        self.assertEqual(self.tab.selected, {video_path})
+        self.assertEqual(video_group.child(1).checkState(0), Qt.CheckState.Checked)
+        self.tab.set_busy(True)
+        self.tab.video_review.checks[0].setChecked(True)
+        self.assertEqual(self.tab.selected, {video_path})
+        self.assertFalse(self.tab.video_review.checks[0].isChecked())
+        self.tab.set_busy(False)
         self.assertTrue(all(view.scene().items() for view in self.tab.video_review.views))
         self.tab.video_review.samples.setCurrentIndex(7)
         self.assertIn("audio is not compared", self.tab.video_review.summary.text())
@@ -114,6 +268,7 @@ class SimilarTabTests(FileTestCase):
         self.assertEqual(opened.call_args.args[0].toLocalFile(), str(original.path).replace('\\', '/'))
         self.tab.back_button.click()
         self.assertEqual(self.tab.gallery.count(), 2)
+        self.assertEqual(self.tab.gallery.item(1).checkState(), Qt.CheckState.Checked)
         self.assertEqual(self.old_state(), before)
 
         self.window.file_type_checks["Videos"].setChecked(True)
@@ -210,12 +365,12 @@ class SimilarTabTests(FileTestCase):
         self.assertEqual(self.tab.gallery.count(), 2)
         self.assertEqual(self.tab.stack.currentIndex(), 0)
         for i in range(2):
-            self.assertIsNone(self.tab.gallery.item(i).data(Qt.ItemDataRole.CheckStateRole))
-            self.assertIsNone(group.child(i).data(0, Qt.ItemDataRole.CheckStateRole))
+            self.assertEqual(self.tab.gallery.item(i).checkState(), Qt.CheckState.Unchecked)
+            self.assertEqual(group.child(i).checkState(0), Qt.CheckState.Unchecked)
         self.tab.tree.setCurrentItem(group.child(1))
         self.assertEqual(self.tab.stack.currentIndex(), 1)
         self.assertNotEqual(self.tab.panes[0].record.path, self.tab.panes[1].record.path)
-        self.assertTrue(all(pane.recycle_check.isHidden() for pane in self.tab.panes))
+        self.assertTrue(all(not pane.recycle_check.isHidden() for pane in self.tab.panes))
         self.wait_for(lambda: all(pane.process is None for pane in self.tab.panes))
         self.tab.back_button.click()
         self.assertEqual(self.tab.gallery.count(), 2)

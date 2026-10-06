@@ -9,12 +9,14 @@ from PySide6.QtCore import QEvent, QEventLoop, QSettings, Qt, QTimer
 from PySide6.QtGui import QFontDatabase
 from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
-from duplicate_cleaner.cleanup import recycle_selected
+from duplicate_cleaner.cleanup import recycle_reviewed_files, recycle_selected
 from duplicate_cleaner.duplicate_folders import FolderScanResult, recycle_duplicate_folders, scan_duplicate_folders
 from duplicate_cleaner.gui import MainWindow
 from duplicate_cleaner.models import ScanResult
 from duplicate_cleaner.scanner import Reporter, scan
 from duplicate_cleaner.scan_workflow import SCAN_MODES
+from duplicate_cleaner.similarity import scan_similar
+from duplicate_cleaner.sessions import load_session
 from tests.support import FileTestCase
 from tests.test_similarity import sample_image
 
@@ -87,6 +89,8 @@ class IncrementalScanTests(FileTestCase):
     def test_added_scan_combines_all_modes_and_keeps_existing_checks(self):
         old = self.complete_scan_for_additions(*SCAN_MODES)
         selected = self.check_first_file()
+        similar_path = self.window.similar_tab.result.groups[0].matches[0][0].record.path
+        self.window.similar_tab.set_checked(similar_path, True)
         for path in old.iterdir():
             self.file("new/" + path.name, path.read_bytes())
         new = self.root / "new"
@@ -94,6 +98,7 @@ class IncrementalScanTests(FileTestCase):
         self.window.start_added_scan()
         self.wait_for(lambda: self.window.scan_worker is None)
         self.assertEqual(self.window.selected, {selected})
+        self.assertEqual(self.window.similar_tab.selected, {similar_path})
         self.assertEqual(len(self.window.groups), 2)
         self.assertEqual({folder.path for folder in self.window.duplicate_folders}, {old, new})
         images = self.window._scan_baselines["similarity"].images
@@ -127,8 +132,10 @@ class IncrementalScanTests(FileTestCase):
             {folder.path for folder in group.folders}) for group in self.window.folder_groups))
 
     def test_failed_later_mode_rolls_back_successful_additions_in_other_modes(self):
-        self.complete_scan_for_additions("duplicates", "folders")
+        self.complete_scan_for_additions(*SCAN_MODES)
         selected = self.check_first_file()
+        similar_path = self.window.similar_tab.result.groups[0].matches[0][0].record.path
+        self.window.similar_tab.set_checked(similar_path, True)
         groups, folders = list(self.window.groups), list(self.window.folder_groups)
         baseline = dict(self.window._scan_baselines)
         self.file("new/renamed.txt", b"unique old contents")
@@ -139,6 +146,7 @@ class IncrementalScanTests(FileTestCase):
         self.assertEqual(self.window.groups, groups)
         self.assertEqual(self.window.folder_groups, folders)
         self.assertEqual(self.window.selected, {selected})
+        self.assertEqual(self.window.similar_tab.selected, {similar_path})
         self.assertEqual(self.window._scan_baselines, baseline)
         self.assertIn("Test folder failure", self.window.status.text())
 
@@ -199,6 +207,62 @@ class IncrementalScanTests(FileTestCase):
             self.wait_for(lambda: self.window.scan_worker is None)
         self.assertNotIn(selected, self.window._scan_baselines["duplicates"].index)
         self.assertFalse(self.window._scan_baselines["duplicates"].groups)
+
+    def test_late_similarity_results_do_not_restore_recycled_duplicate_files(self):
+        entered = Event()
+        self.choose_modes("duplicates", "similarity")
+        def delayed(*args, **kwargs):
+            result = scan_similar(*args, **kwargs)
+            entered.set()
+            if not self.release.wait(10):
+                raise TimeoutError("Test did not release cached similarity results")
+            return result
+        with patch("duplicate_cleaner.scan_workflow.scan_similar", side_effect=delayed):
+            self.window.start_scan()
+            self.wait_for(entered.is_set)
+            selected = self.check_first_file()
+            result = recycle_selected(self.window.groups, [selected],
+                recycler=lambda path, check: (check(), path.rename(self.root / "recycled-fixture.png")))
+            with patch.object(QMessageBox, "exec", return_value=0):
+                self.window.on_recycled(result)
+            self.release.set()
+            self.wait_for(lambda: self.window.scan_worker is None)
+        self.assertNotIn(selected, self.window.similar_tab.records)
+        self.assertNotIn(selected, {image.record.path for image in self.window._scan_baselines["similarity"].images})
+
+    def test_similar_cleanup_prunes_other_tabs_and_late_folder_results(self):
+        old = self.complete_scan_for_additions(*SCAN_MODES)
+        image = (old / "first.png").read_bytes()
+        removed = self.file("old/left/a.png", image)
+        self.file("old/right/b.png", image)
+        entered = Event()
+        def delayed(*args, **kwargs):
+            result = scan_duplicate_folders(*args, **kwargs)
+            entered.set()
+            if not self.release.wait(10):
+                raise TimeoutError("Test did not release cached folder results")
+            return result
+        with patch("duplicate_cleaner.scan_workflow.scan_duplicate_folders", side_effect=delayed):
+            self.window.start_scan()
+            self.wait_for(entered.is_set)
+            self.window.similar_tab.set_checked(removed, True)
+            self.assertTrue(self.window.similar_tab.recycle_button.isEnabled())
+            result = recycle_reviewed_files(self.window.similar_tab.records.values(), [removed],
+                recycler=lambda path, check: (check(), path.rename(self.root / "reviewed-fixture.png")))
+            with patch.object(QMessageBox, "exec", return_value=0):
+                self.window.on_similar_recycled(result)
+            self.assertNotIn(removed, self.window.records)
+            self.release.set()
+            self.wait_for(lambda: self.window.scan_worker is None)
+        self.assertTrue(all(removed != file.path for folder in self.window.duplicate_folders for file in folder.files))
+        self.assertNotIn(removed, self.window._scan_baselines["duplicates"].index)
+        self.assertNotIn(old / "left", self.window._scan_baselines["folders"].index)
+        self.file("new/next.png", image)
+        self.window.add_folder_path(str(self.root / "new"))
+        self.window.start_added_scan()
+        self.wait_for(lambda: self.window.scan_worker is None)
+        self.assertNotIn(removed, self.window.records)
+        self.assertNotIn(removed, self.window.similar_tab.records)
 
     def test_settings_restart_waits_for_a_completed_result_operation(self):
         entered = Event()
@@ -393,6 +457,30 @@ class IncrementalScanTests(FileTestCase):
             self.assertEqual(window.selected, {path})
             self.assertEqual(window.groups, groups)
             self.assertTrue(window.scan_button.isEnabled())
+
+    def test_completed_similarity_can_be_saved_before_folder_scan_finishes(self):
+        with patch("duplicate_cleaner.scan_workflow.scan_duplicate_folders", side_effect=self.blocked_empty):
+            self.choose_modes("similarity", "folders")
+            self.window.start_scan()
+            self.wait_for(lambda: self.window.scan_mode_states.get("similarity") == "Ready")
+            self.assertIsNotNone(self.window.scan_worker)
+            self.assertTrue(self.window.save_session_button.isEnabled())
+            self.window.similar_tab.select_group(self.window.similar_tab.result.groups[0])
+            selected = set(self.window.similar_tab.selected)
+            destination = self.root / "completed-similar.dupsession"
+            with patch.object(QFileDialog, "getSaveFileName", return_value=(str(destination), "")):
+                self.window.save_session()
+            self.wait_for(lambda: self.window.worker is None)
+            self.assertTrue(destination.is_file())
+            self.assertIsNotNone(self.window.scan_worker)
+            loaded = load_session(destination).data
+            self.assertFalse(loaded.duplicate_available)
+            self.assertIsNone(loaded.folder_result)
+            self.assertEqual(loaded.similar_result.groups, self.window.similar_tab.result.groups)
+            self.assertEqual(loaded.selected_similar, selected)
+            self.release.set()
+            self.wait_for(lambda: self.window.scan_worker is None)
+            self.assertEqual(self.window.similar_tab.selected, selected)
 
     def test_recycling_completed_mode_is_not_undone_by_final_scan_result(self):
         def recycler(path, revalidate):

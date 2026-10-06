@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
     QToolButton, QVBoxLayout, QWidget,
 )
 
-from .cleanup import recycle_selected
+from .cleanup import recycle_reviewed_files, recycle_selected
 from .duplicate_folders import (FolderRecord, FolderGroup, FolderScanResult,
                                 ensure_folder_current, recycle_duplicate_folders)
 from .scanner import Reporter
@@ -27,7 +27,7 @@ from .scan_control import ScanControl
 from .files import ensure_current
 from .file_types import FILE_TYPES, file_type
 from .scan_workflow import SCAN_MODES, run_selected_scans
-from .similarity import PRESETS, SimilarResult
+from .similarity import PRESETS, SimilarResult, prune_similar_result
 from .models import DuplicateGroup, FileRecord, Progress, RecycleResult, ScanResult, SearchCriteria, format_bytes
 from .preview import ComparisonPreview
 from .similar_tab import SimilarTab
@@ -305,6 +305,8 @@ class MainWindow(QMainWindow):
         self.folder_groups: list[FolderGroup] = []
         self.duplicate_folders: list[FolderRecord] = []
         self.selected_duplicate_folders: set[Path] = set()
+        self.folder_session_available = False
+        self.folder_scan_count = 0
         self.duplicate_folder_issues = []
         self._changing_empty_checks = False
 
@@ -392,7 +394,7 @@ class MainWindow(QMainWindow):
         self.pause_button.clicked.connect(self.toggle_scan_pause)
         self.pause_button.setToolTip("Pause to add disks or change criteria. Changed settings restart the scan on Resume.")
         self.save_session_button = QPushButton("Save session…")
-        self.save_session_button.setToolTip("Save these results and checked files so you can continue later.")
+        self.save_session_button.setToolTip("Save completed results and checked items from all result tabs so you can continue later.")
         self.save_session_button.clicked.connect(self.save_session)
         self.load_session_button = QPushButton("Load session…")
         self.load_session_button.setToolTip("Load saved results without scanning file contents again.")
@@ -757,6 +759,8 @@ class MainWindow(QMainWindow):
         self.duplicate_folder_tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self.duplicate_folder_tree.setColumnWidth(0, 170)
         self.duplicate_folder_tree.itemChanged.connect(self.duplicate_folder_item_changed)
+        self.duplicate_folder_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.duplicate_folder_tree.customContextMenuRequested.connect(self.show_duplicate_folder_menu)
         self.duplicate_folder_tree.itemDoubleClicked.connect(self.open_duplicate_folder)
         empty_content.addWidget(self.duplicate_folder_tree, 1)
         empty_foot = QHBoxLayout()
@@ -786,6 +790,9 @@ class MainWindow(QMainWindow):
         empty_content.addLayout(empty_action)
         self.folder_page = folder_page
         self.similar_tab = SimilarTab()
+        self.similar_tab.recycle_requested.connect(self.confirm_similar_recycle)
+        self.similar_tab.open_location_requested.connect(self.open_record_folder)
+        self.similar_tab.results_changed.connect(self.update_actions)
         self.workflow_tabs.addTab(self.location_page, "Scan location")
         self.workflow_tabs.addTab(self.criteria_scroll, "Search criteria")
         self.workflow_tabs.addTab(self.duplicate_page, "Duplicate files")
@@ -989,7 +996,7 @@ class MainWindow(QMainWindow):
         added, reason = self.added_scan_scope()
         self.scan_added_button.setEnabled(not busy and bool(added) and not reason)
         self.scan_added_button.setToolTip(reason or "Scan only added locations and compare them with retained results. Old candidate copies may be read for verification.")
-        self.save_session_button.setEnabled(not duplicates_busy and self.session_available)
+        self.save_session_button.setEnabled(bool(self.savable_session_modes()))
         self.load_session_button.setEnabled(not busy)
         self.cancel_button.setEnabled(any(worker is not None and not worker.cancel_event.is_set()
                                           for worker in (self.worker, self.scan_worker)))
@@ -1256,6 +1263,7 @@ class MainWindow(QMainWindow):
         if "similarity" in modes:
             self.similar_tab.prepare_scan()
         if "folders" in modes:
+            self.folder_session_available = False
             self.set_duplicate_folders([])
             self.duplicate_folder_issues = []
             self.duplicate_folder_summary.setText("Waiting for duplicate-folder scan…")
@@ -1376,6 +1384,8 @@ class MainWindow(QMainWindow):
                     "folders": self.on_duplicate_folder_scan}
         previous_status = self.status.text()
         if result is not None:
+            for paths, folders in self._scan_recycled:
+                result = self.prune_scan_result(mode, result, paths, folders=folders)
             handlers[mode](result)
             state = "Cancelled" if result.cancelled else "Ready"
             count = len(result.folders) if mode == "folders" else len(result.groups)
@@ -1410,13 +1420,14 @@ class MainWindow(QMainWindow):
                        all(not result.cancelled for result in outcome.results.values()))
             if success:
                 selected_files, selected_folders = set(self.selected), set(self.selected_duplicate_folders)
+                selected_similar = set(self.similar_tab.selected)
                 for mode, result in outcome.results.items():
                     if mode == "duplicates":
                         self.on_scan(result)
                     elif mode == "folders":
                         self.on_duplicate_folder_scan(result)
                     else:
-                        self.similar_tab.on_result(result)
+                        self.similar_tab.on_result(result, selected=selected_similar)
                 self.restore_scan_selection(selected_files, selected_folders)
                 self._scan_baselines = dict(outcome.results)
                 self._baseline_settings = self._scan_settings
@@ -1473,6 +1484,7 @@ class MainWindow(QMainWindow):
             self.start_scan()
 
     def restore_scan_selection(self, files, folders):
+        files, folders = set(files), set(folders)
         self._changing_checks = True
         self._changing_empty_checks = True
         try:
@@ -1487,48 +1499,42 @@ class MainWindow(QMainWindow):
             self._changing_empty_checks = False
         self.refresh_selection_view()
 
-    def prune_scan_baselines(self, paths, *, folders=False):
+    @staticmethod
+    def prune_scan_result(mode, result, paths, *, folders=False):
         paths = set(paths)
         if not paths:
-            return
+            return result
         def removed(path):
             return path in paths or (folders and any(root in path.parents for root in paths))
 
+        if mode == "duplicates":
+            index = {path: item for path, item in result.index.items() if not removed(path)}
+            groups = []
+            for group in result.groups:
+                files = tuple(record for record in group.files if not removed(record.path))
+                if len(files) > 1:
+                    groups.append(DuplicateGroup(files, group.digest, group.byte_verified))
+            return replace(result, index=index, groups=groups,
+                file_count=len(index), total_bytes=sum(item.record.total_size for item in index.values()))
+        if mode == "similarity":
+            return prune_similar_result(result, paths, folders=folders)
+        def kept_tree(tree):
+            return (not any(removed(file.path) for file in tree.files)
+                    and not (folders and any(tree.path == root or tree.path in root.parents
+                                             or root in tree.path.parents for root in paths)))
+        index = {path: tree for path, tree in result.index.items() if kept_tree(tree)}
+        groups = []
+        for group in result.groups:
+            copies = tuple(tree for tree in group.folders if kept_tree(tree))
+            if len(copies) > 1 or (copies and copies[0].empty):
+                groups.append(FolderGroup(copies))
+        known_files = {file.path for tree in index.values() for file in tree.files}
+        return replace(result, index=index, groups=groups,
+            file_ids={path: value for path, value in result.file_ids.items() if path in known_files})
+
+    def prune_scan_baselines(self, paths, *, folders=False):
         for mode, result in tuple(self._scan_baselines.items()):
-            if mode == "duplicates":
-                index = {path: item for path, item in result.index.items() if not removed(path)}
-                groups = []
-                for group in result.groups:
-                    files = tuple(record for record in group.files if not removed(record.path))
-                    if len(files) > 1:
-                        groups.append(DuplicateGroup(files, group.digest, group.byte_verified))
-                self._scan_baselines[mode] = replace(result, index=index, groups=groups,
-                    file_count=len(index), total_bytes=sum(item.record.total_size for item in index.values()))
-            elif mode == "similarity":
-                images = tuple(image for image in result.images if not removed(image.record.path))
-                videos = tuple(video for video in result.videos if not removed(video.record.path))
-                groups = []
-                for group in result.groups:
-                    if removed(group.reference.record.path):
-                        continue
-                    matches = tuple((item, distance) for item, distance in group.matches if not removed(item.record.path))
-                    if matches:
-                        groups.append(type(group)(group.reference, matches))
-                self._scan_baselines[mode] = replace(result, images=images, videos=videos, groups=groups,
-                    image_count=len(images), video_count=len(videos), compared_count=len(images) + len(videos),
-                    videos_compared=len(videos))
-            else:
-                index = {path: tree for path, tree in result.index.items()
-                         if not any(removed(file.path) for file in tree.files)
-                         and not (folders and any(path == root or path in root.parents or root in path.parents for root in paths))}
-                groups = []
-                for group in result.groups:
-                    copies = tuple(tree for tree in group.folders if tree.path in index)
-                    if len(copies) > 1 or (copies and copies[0].empty):
-                        groups.append(FolderGroup(copies))
-                known_files = {file.path for tree in index.values() for file in tree.files}
-                self._scan_baselines[mode] = replace(result, index=index, groups=groups,
-                    file_ids={path: value for path, value in result.file_ids.items() if path in known_files})
+            self._scan_baselines[mode] = self.prune_scan_result(mode, result, paths, folders=folders)
 
     def record_scan_cleanup(self, paths, *, folders=False):
         self.prune_scan_baselines(paths, folders=folders)
@@ -1536,7 +1542,8 @@ class MainWindow(QMainWindow):
             self._scan_recycled.append((tuple(paths), folders))
 
     def save_session(self):
-        if self.mode_busy("duplicates") or not self.session_available:
+        modes = self.savable_session_modes()
+        if not modes:
             return
         if self.session_path is None:
             default = Path.home() / f"Duplicate Cleaner {datetime.now():%Y-%m-%d %H%M}.dupsession"
@@ -1551,17 +1558,36 @@ class MainWindow(QMainWindow):
         if not path.suffix:
             path = path.with_suffix(".dupsession")
         data = SessionData(
-            tuple(self.groups), frozenset(self.selected),
+            tuple(self.groups) if "duplicates" in modes else (),
+            frozenset(self.selected) if "duplicates" in modes else frozenset(),
             tuple(self.folders.item(index).text() for index in range(self.folders.count())),
-            self.recursive.isChecked(), tuple(self.issues), self.scan_file_count,
-            self.scan_total_bytes, self.type_tabs.tabText(self.type_tabs.currentIndex()),
+            self.recursive.isChecked(), tuple(self.issues) if "duplicates" in modes else (),
+            self.scan_file_count if "duplicates" in modes else 0,
+            self.scan_total_bytes if "duplicates" in modes else 0, self.type_tabs.tabText(self.type_tabs.currentIndex()),
             excluded_folders=self.excluded_folder_paths(),
+            folder_result=FolderScanResult(groups=list(self.folder_groups), issues=list(self.duplicate_folder_issues),
+                folder_count=self.folder_scan_count) if "folders" in modes else None,
+            similar_result=replace(self.similar_tab.result, groups=list(self.similar_tab.result.groups),
+                issues=list(self.similar_tab.result.issues), images=(), videos=(), roots=(), settings=()) if "similarity" in modes else None,
+            selected_folders=frozenset(self.selected_duplicate_folders) if "folders" in modes else frozenset(),
+            selected_similar=frozenset(self.similar_tab.selected) if "similarity" in modes else frozenset(),
+            active_workflow=self.active_workflow(), duplicate_available="duplicates" in modes,
         )
         self.status.setText("Preparing session file…")
         self.start_job(
             lambda **kwargs: save_session_file(path, data, **kwargs), self.on_session_saved,
             lambda message: self.on_session_failure("Could not save session", message),
         )
+
+    def savable_session_modes(self):
+        available = {"duplicates": self.session_available, "folders": self.folder_session_available,
+                     "similarity": self.similar_tab.session_available}
+        return tuple(mode for mode, ready in available.items() if ready and not self.mode_busy(mode))
+
+    def active_workflow(self):
+        pages = {"duplicates": self.duplicate_page, "folders": self.folder_page, "similarity": self.similar_tab,
+                 "location": self.location_page, "criteria": self.criteria_page}
+        return next(key for key, page in pages.items() if page is self.workflow_tabs.currentWidget())
 
     def on_session_saved(self, result: SaveResult):
         if result.cancelled:
@@ -1593,19 +1619,20 @@ class MainWindow(QMainWindow):
         if data is None:
             self.on_session_failure("Could not load session", "The session did not contain usable data.")
             return
-        restorable = len(data.selected)
+        restorable = len(data.selected) + len(data.selected_folders) + len(data.selected_similar)
         saved_when = datetime.fromisoformat(data.saved_at).strftime("%Y-%m-%d %H:%M:%S")
         dialog = QMessageBox(self)
         dialog.setWindowTitle("Load saved session")
         dialog.setIcon(QMessageBox.Icon.Question)
-        dialog.setText(f"Load the duplicate results saved on {saved_when}?")
+        dialog.setText(f"Load the results saved on {saved_when}?")
         information = (
             "Loading replaces the results and selections currently shown. Files were checked for "
-            "identity and timestamps; contents will still be verified again before recycling."
+            "identity and timestamps, and complete folder membership was checked. Duplicate contents "
+            "are verified again before recycling. Similar-file cleanup requires your visual review."
         )
         if result.saved_selection_count:
             information = (
-                f"This session saved {result.saved_selection_count:,} checked file(s). "
+                f"This session saved {result.saved_selection_count:,} checked item(s). "
                 f"{restorable:,} can be restored and {result.dropped_selected:,} cannot be restored.\n\n"
                 + information
             )
@@ -1613,7 +1640,7 @@ class MainWindow(QMainWindow):
         without = dialog.addButton("Load with nothing checked", QMessageBox.ButtonRole.AcceptRole)
         restore = None
         if restorable:
-            restore_noun = "file" if restorable == 1 else "files"
+            restore_noun = "item" if restorable == 1 else "items"
             restore = dialog.addButton(f"Restore {restorable:,} checked {restore_noun}",
                                        QMessageBox.ButtonRole.ActionRole)
         cancel = dialog.addButton(QMessageBox.StandardButton.Cancel)
@@ -1628,11 +1655,10 @@ class MainWindow(QMainWindow):
         self._scan_baselines = {}
         self._baseline_settings = None
 
-        self.workflow_tabs.setCurrentWidget(self.duplicate_page)
         self.issues = list(data.issues) + list(result.validation_issues)
         self.scan_file_count = data.file_count
         self.scan_total_bytes = data.total_bytes
-        self.session_available = True
+        self.session_available = data.duplicate_available
         self.session_path = result.path
         self.folders.clear()
         self.excluded_folders.clear()
@@ -1644,16 +1670,23 @@ class MainWindow(QMainWindow):
         self.summary_notice = None
         self.summary_context = "loaded"
         self.set_groups(data.groups)
-        if restore_checks:
-            self._changing_checks = True
-            try:
-                for item in self.file_items():
-                    record = item.data(0, Qt.ItemDataRole.UserRole)
-                    if record.path in data.selected:
-                        item.setCheckState(0, Qt.CheckState.Checked)
-                self.selected.update(data.selected)
-            finally:
-                self._changing_checks = False
+        folder_result = data.folder_result or FolderScanResult()
+        self.on_duplicate_folder_scan(replace(folder_result, issues=list(folder_result.issues) + list(result.validation_issues)))
+        self.folder_session_available = data.folder_result is not None
+        similar_result = data.similar_result or SimilarResult()
+        self.similar_tab.on_result(replace(similar_result, issues=list(similar_result.issues) + list(result.validation_issues)),
+                                  selected=data.selected_similar if restore_checks else ())
+        self.similar_tab.session_available = data.similar_result is not None
+        self.restore_scan_selection(data.selected if restore_checks else (), data.selected_folders if restore_checks else ())
+        available = {"duplicates": data.duplicate_available, "folders": data.folder_result is not None,
+                     "similarity": data.similar_result is not None}
+        self.scan_mode_states = {mode: "Ready" for mode, ready in available.items() if ready}
+        for mode, checkbox in self.mode_checks.items():
+            checkbox.setChecked(available[mode])
+        self.update_scan_tab_titles()
+        pages = {"duplicates": self.duplicate_page, "folders": self.folder_page, "similarity": self.similar_tab,
+                 "location": self.location_page, "criteria": self.criteria_page}
+        self.workflow_tabs.setCurrentWidget(pages[data.active_workflow])
         tab_name = data.active_tab
         if tab_name == "Selected groups":
             tab_name = "Selected"
@@ -1665,10 +1698,11 @@ class MainWindow(QMainWindow):
         self.filter_results()
         self.empty.setText(
             "No usable duplicate groups remain in this session. Changed or missing files are listed under errors.")
-        action = f"{len(data.selected):,} saved checks restored" if restore_checks else "all files left unchecked"
+        action = f"{restorable:,} saved checks restored" if restore_checks else "all items left unchecked"
         self.status.setText(
             f"Session loaded · {action} · {result.dropped_files:,} changed or missing files · "
-            f"{result.dropped_groups:,} incomplete groups removed")
+            f"{result.dropped_folders:,} changed folders · {result.dropped_groups:,} incomplete groups removed")
+        self.update_actions()
 
     def on_session_failure(self, title, message):
         self.status.setText(message)
@@ -1804,17 +1838,35 @@ class MainWindow(QMainWindow):
 
     def show_result_menu(self, position):
         item = self.tree.itemAt(position)
-        if item is None or item.parent() is None:
+        if item is None:
             return
         self.tree.setCurrentItem(item)
         menu = QMenu(self)
-        open_location = menu.addAction("Open file location")
-        open_location.triggered.connect(self.open_folder)
-        menu.addSeparator()
-        select_folder = menu.addAction("Select this folder's duplicates (keep one copy)")
-        select_folder.setEnabled(not self.mode_busy("duplicates"))
-        select_folder.triggered.connect(lambda: self.select_folder_duplicates(item))
+        if item.parent() is not None:
+            open_location = menu.addAction("Open file location")
+            open_location.triggered.connect(self.open_folder)
+            menu.addSeparator()
+            select_folder = menu.addAction("Select this folder's duplicates (keep one copy)")
+            select_folder.setEnabled(not self.mode_busy("duplicates"))
+            select_folder.triggered.connect(lambda: self.select_folder_duplicates(item))
+        select_group = menu.addAction("Select all items in this group")
+        select_group.setEnabled(not self.mode_busy("duplicates"))
+        select_group.triggered.connect(lambda: self.select_duplicate_group(item))
         menu.exec(self.tree.viewport().mapToGlobal(position))
+
+    def select_duplicate_group(self, item):
+        if self.mode_busy("duplicates"):
+            return
+        parent = item.parent() or item
+        group = parent.data(0, Qt.ItemDataRole.UserRole)
+        self.selected.update(record.path for record in group.files)
+        self._changing_checks = True
+        try:
+            for index in range(parent.childCount()):
+                parent.child(index).setCheckState(0, Qt.CheckState.Checked)
+        finally:
+            self._changing_checks = False
+        self.refresh_selection_view()
 
     def clear_selection(self):
         self._changing_checks = True
@@ -1960,6 +2012,35 @@ class MainWindow(QMainWindow):
             for child in range(parent.childCount()):
                 yield parent.child(child)
 
+    def show_duplicate_folder_menu(self, position):
+        item = self.duplicate_folder_tree.itemAt(position)
+        if item is None:
+            return
+        self.duplicate_folder_tree.setCurrentItem(item)
+        menu = QMenu(self)
+        if item.parent() is not None:
+            open_folder = menu.addAction("Open folder")
+            open_folder.setEnabled(not self.mode_busy("folders"))
+            open_folder.triggered.connect(lambda: self.open_duplicate_folder(item))
+        select_group = menu.addAction("Select all items in this group")
+        select_group.setEnabled(not self.mode_busy("folders"))
+        select_group.triggered.connect(lambda: self.select_duplicate_folder_group(item))
+        menu.exec(self.duplicate_folder_tree.viewport().mapToGlobal(position))
+
+    def select_duplicate_folder_group(self, item):
+        if self.mode_busy("folders"):
+            return
+        parent = item.parent() or item
+        group = parent.data(0, Qt.ItemDataRole.UserRole)
+        self.selected_duplicate_folders.update(folder.path for folder in group.folders)
+        self._changing_empty_checks = True
+        try:
+            for index in range(parent.childCount()):
+                parent.child(index).setCheckState(0, Qt.CheckState.Checked)
+        finally:
+            self._changing_empty_checks = False
+        self.update_actions()
+
     @staticmethod
     def group_folder_size(group):
         sizes = [folder.total_size for folder in group.folders]
@@ -1987,6 +2068,8 @@ class MainWindow(QMainWindow):
         self.update_actions()
 
     def on_duplicate_folder_scan(self, result: FolderScanResult):
+        self.folder_session_available = not result.cancelled
+        self.folder_scan_count = result.folder_count
         self.duplicate_folder_issues = result.issues
         self.set_duplicate_folders(result.groups)
         if result.cancelled:
@@ -2061,8 +2144,8 @@ class MainWindow(QMainWindow):
                 if len(files) > 1:
                     file_groups.append(DuplicateGroup(files, group.digest, group.byte_verified))
             self.set_groups(file_groups)
-            self.similar_tab.on_result(SimilarResult())
-            self.similar_tab.summary.setText("Folder cleanup changed files. Scan again to refresh similar results.")
+            self.similar_tab.on_result(prune_similar_result(self.similar_tab.result, recycled, folders=True),
+                                       selected=set(self.similar_tab.selected), session_available=self.similar_tab.session_available)
         noun = "folder" if len(self.duplicate_folders) == 1 else "folders"
         self.duplicate_folder_summary.setText(
             f"{len(self.duplicate_folders):,} listed {noun} remaining · all checks cleared")
@@ -2188,8 +2271,84 @@ class MainWindow(QMainWindow):
         self.issues = []
         self.start_job(lambda **kwargs: recycle_selected(groups, selected, **options, **kwargs), self.on_recycled)
 
+    def confirm_similar_recycle(self):
+        tab = self.similar_tab
+        if self.mode_busy("similarity") or not tab.selected:
+            return
+        selected = frozenset(tab.selected)
+        records = tuple(tab.records.values())
+        amount = sum(tab.records[path].total_size for path in selected)
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setWindowTitle("Recycle reviewed similar files")
+        dialog.setText(f"Send {len(selected):,} selected similar files ({format_bytes(amount)}) to the Recycle Bin?")
+        information = ("Similar files may contain different content. Review each selected file before recycling; "
+                       "this action does not require identical contents. Video matching does not compare audio.\n\n"
+                       "Only checked files will be recycled, with their own NTFS extra data. "
+                       "File identity, timestamps, path safety, and stream layout are checked again. "
+                       "Nothing is permanently deleted.")
+        all_selected = 0
+        details = ["SELECTED FOR RECYCLING", *sorted(map(str, selected)), "", "FILES KEPT IN AFFECTED GROUPS"]
+        for number, group in enumerate(tab.result.groups, 1):
+            paths = {image.record.path for image, evidence in ((group.reference, None), *group.matches)}
+            if paths & selected:
+                kept = paths - selected
+                details.append(f"Group {number}")
+                details.extend(sorted(map(str, kept)) or ["NONE — every listed file is selected for recycling."])
+                all_selected += not kept
+        if all_selected:
+            information = (f"WARNING: All files selected in {all_selected:,} group(s). "
+                           "No listed file will remain in those groups if recycling succeeds.\n\n" + information)
+        dialog.setInformativeText(information)
+        dialog.setDetailedText("\n".join(details))
+        recycle = dialog.addButton("Recycle selected files", QMessageBox.ButtonRole.AcceptRole)
+        cancel = dialog.addButton(QMessageBox.StandardButton.Cancel)
+        dialog.setDefaultButton(cancel)
+        dialog.exec()
+        if dialog.clickedButton() != recycle:
+            return
+        tab.clear_preview()
+        self.start_job(lambda **kwargs: recycle_reviewed_files(records, selected, **kwargs),
+                       self.on_similar_recycled, self.on_similar_recycle_failure)
+
+    def on_similar_recycled(self, result: RecycleResult):
+        self.record_scan_cleanup(result.recycled)
+        selected_files, selected_folders = set(self.selected), set(self.selected_duplicate_folders)
+        if result.recycled:
+            remaining_files = self.prune_scan_result("duplicates", ScanResult(groups=list(self.groups)), result.recycled)
+            self.set_groups(remaining_files.groups)
+            remaining_folders = self.prune_scan_result("folders", FolderScanResult(groups=list(self.folder_groups)), result.recycled)
+            self.set_duplicate_folders(remaining_folders.groups)
+            self.restore_scan_selection(selected_files, selected_folders)
+        remaining = prune_similar_result(self.similar_tab.result, result.recycled)
+        self.similar_tab.on_result(replace(remaining, issues=list(result.issues)))
+        message = ("Similar-file cleanup cancelled; already recycled files remain in the Recycle Bin."
+                   if result.cancelled else "Similar-file cleanup complete. All checks cleared.")
+        self.similar_tab.status.setText(message)
+        self.status.setText(message)
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Similar-file recycling results")
+        dialog.setText(f"{len(result.recycled):,} files recycled · {len(result.issues):,} skipped / errors")
+        dialog.setInformativeText(message + "\nIf a group's reference was recycled, its remaining files need a new scan to regroup.")
+        dialog.setDetailedText("\n".join(["RECYCLED", *map(str, result.recycled), "", "SKIPPED / ERRORS",
+                                        *(f"{issue.path}: {issue.reason}" for issue in result.issues)]))
+        dialog.exec()
+
+    def on_similar_recycle_failure(self, message):
+        self._scan_cache_valid = False
+        self._scan_baselines = {}
+        self._baseline_settings = None
+        self.similar_tab.selected.clear()
+        self.similar_tab.sync_checks()
+        self.similar_tab.status.setText("Cleanup stopped. Some files may already have been recycled; check the Recycle Bin and scan again.")
+        self.status.setText(message)
+        QMessageBox.critical(self, "Similar-file cleanup stopped", message + "\n\n" + self.similar_tab.status.text())
+
     def on_recycled(self, result: RecycleResult):
         self.record_scan_cleanup(result.recycled)
+        if result.recycled:
+            self.similar_tab.on_result(prune_similar_result(self.similar_tab.result, result.recycled),
+                                       selected=set(self.similar_tab.selected), session_available=self.similar_tab.session_available)
         if result.recycled:
             recycled_paths = set(result.recycled)
             remaining_folders = []
@@ -2283,8 +2442,11 @@ class MainWindow(QMainWindow):
         item = self.tree.currentItem()
         if item is not None and item.parent() is not None:
             record = item.data(0, Qt.ItemDataRole.UserRole)
-            if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(record.path.parent))):
-                QMessageBox.warning(self, "Could not open folder", str(record.path.parent))
+            self.open_record_folder(record)
+
+    def open_record_folder(self, record):
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(record.path.parent))):
+            QMessageBox.warning(self, "Could not open folder", str(record.path.parent))
 
     def open_duplicate_folder(self, item, column=0):
         if self.mode_busy("folders") or item is None or item.parent() is None:

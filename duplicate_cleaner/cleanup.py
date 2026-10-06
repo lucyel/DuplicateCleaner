@@ -5,9 +5,53 @@ from threading import Event
 from typing import Callable, Iterable
 
 from .files import ensure_current, open_checked, open_named_streams, UnsafeFile
-from .models import Cancelled, DuplicateGroup, Issue, Progress, RecycleResult
+from .models import Cancelled, DuplicateGroup, FileRecord, Issue, Progress, RecycleResult
 from .scanner import compare_streams, differing_named_streams, Reporter
 from .windows_trash import recycle_file
+
+
+def recycle_reviewed_files(records: Iterable[FileRecord], selected: Iterable[Path], *,
+                           cancel: Event | None = None,
+                           progress: Callable[[Progress], None] | None = None,
+                           recycler: Callable = recycle_file) -> RecycleResult:
+    """Recycle explicitly reviewed similar files; similarity is not duplicate proof."""
+    records = tuple(records)
+    selected = {Path(os.path.abspath(path)) for path in selected}
+    known = {record.path for record in records}
+    identities = {(record.device, record.inode) for record in records}
+    if len(known) != len(records) or len(identities) != len(records):
+        raise ValueError("Duplicate file identities in the results; scan again")
+    if selected - known:
+        raise ValueError("The selection contains files outside the reviewed results")
+    result = RecycleResult()
+    reporter = Reporter(cancel if cancel is not None else Event(), progress)
+    reporter.stage = "Rechecking and recycling reviewed files"
+    reporter.total = len(selected)
+    try:
+        reporter.emit(True)
+        for record in records:
+            if record.path not in selected:
+                continue
+            reporter.check()
+            reporter.path = str(record.path)
+            try:
+                with open_checked(record, allow_delete=True), open_named_streams(record, allow_delete=True):
+                    def revalidate():
+                        reporter.check()
+                        ensure_current(record)
+                    revalidate()
+                    recycler(record.path, revalidate)
+                    # Record success before handle cleanup, which could itself fail.
+                    result.recycled.append(record.path)
+            except OSError as exc:
+                result.issues.append(Issue(record.path, str(exc)))
+            reporter.completed += 1
+            reporter.emit(True)
+        reporter.path = ""
+        reporter.emit(True)
+    except Cancelled:
+        result.cancelled = True
+    return result
 
 
 def recycle_selected(groups: Iterable[DuplicateGroup], selected: Iterable[Path], *,

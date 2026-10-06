@@ -5,7 +5,7 @@ import math
 import os
 import subprocess
 import sys
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from statistics import median
 from threading import Event
@@ -53,6 +53,25 @@ class SimilarResult:
     videos: tuple = field(default=(), repr=False)
     roots: tuple[Path, ...] = ()
     settings: tuple = field(default=(), repr=False)
+
+
+def prune_similar_result(result, paths, *, folders=False):
+    paths = set(paths)
+    def removed(path):
+        return path in paths or (folders and any(root in path.parents for root in paths))
+    images = tuple(image for image in result.images if not removed(image.record.path))
+    videos = tuple(video for video in result.videos if not removed(video.record.path))
+    groups = []
+    for group in result.groups:
+        # Distances and sampled-video evidence refer only to the original reference.
+        if removed(group.reference.record.path):
+            continue
+        matches = tuple((item, evidence) for item, evidence in group.matches if not removed(item.record.path))
+        if matches:
+            groups.append(type(group)(group.reference, matches))
+    return replace(result, images=images, videos=videos, groups=groups,
+                   image_count=len(images), video_count=len(videos),
+                   compared_count=len(images) + len(videos), videos_compared=len(videos))
 
 
 def fingerprint_image(record: FileRecord) -> ImageFingerprint:

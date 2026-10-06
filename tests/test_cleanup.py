@@ -1,13 +1,122 @@
 import os
+import unittest
 from contextlib import contextmanager
 from threading import Event
 from unittest.mock import Mock, patch
 
-from duplicate_cleaner.cleanup import recycle_selected
-from duplicate_cleaner.files import open_checked
+from duplicate_cleaner.cleanup import recycle_reviewed_files, recycle_selected
+from duplicate_cleaner.files import capture, open_checked
 from duplicate_cleaner.models import SearchCriteria
 from duplicate_cleaner.scanner import compare_streams, scan
 from tests.support import FileTestCase
+
+
+class ReviewedCleanupTests(FileTestCase):
+    def records(self):
+        return [capture(self.file("reviewed-a.png", b"first version")),
+                capture(self.file("reviewed-b.jpg", b"a different version"))]
+
+    def test_selected_similar_files_need_not_have_identical_contents(self):
+        records = self.records()
+        calls = []
+        def recycler(path, revalidate):
+            revalidate()
+            calls.append(path)
+            path.rename(path.with_suffix(".recycled-fixture"))
+        outcome = recycle_reviewed_files(records, [records[1].path], recycler=recycler)
+        self.assertEqual(outcome.recycled, [records[1].path])
+        self.assertEqual(calls, outcome.recycled)
+        self.assertFalse(outcome.issues)
+        self.assertTrue(records[0].path.exists())
+
+    def test_unknown_selection_and_repeated_identities_are_rejected(self):
+        records = self.records()
+        for known, selected in ((records, [self.root / "unknown"]), ([records[0], records[0]], [records[0].path])):
+            with self.subTest(selected=selected), self.assertRaises(ValueError):
+                recycle_reviewed_files(known, selected, recycler=Mock())
+
+    def test_changed_replaced_missing_or_newly_hardlinked_files_are_skipped(self):
+        for change in ("changed", "replaced", "missing", "hardlinked"):
+            with self.subTest(change=change):
+                path = self.file(change + ".png", b"reviewed")
+                record = capture(path)
+                if change == "changed":
+                    path.write_bytes(b"now different")
+                elif change == "replaced":
+                    path.rename(path.with_suffix(".old-fixture"))
+                    path.write_bytes(b"replacement")
+                elif change == "missing":
+                    path.rename(path.with_suffix(".missing-fixture"))
+                else:
+                    os.link(path, path.with_suffix(".hardlink-fixture"))
+                recycler = Mock()
+                outcome = recycle_reviewed_files([record], [path], recycler=recycler)
+                recycler.assert_not_called()
+                self.assertFalse(outcome.recycled)
+                self.assertEqual(len(outcome.issues), 1)
+
+    def test_safe_path_failures_and_shell_veto_are_reported_without_success(self):
+        records = self.records()
+        recycler = Mock()
+        with patch("duplicate_cleaner.files.check_location", side_effect=OSError("Unsafe path")):
+            outcome = recycle_reviewed_files(records, [records[0].path], recycler=recycler)
+        recycler.assert_not_called()
+        self.assertEqual(outcome.issues[0].reason, "Unsafe path")
+        outcome = recycle_reviewed_files(records, [records[0].path], recycler=Mock(side_effect=OSError("Shell veto")))
+        self.assertFalse(outcome.recycled)
+        self.assertEqual(outcome.issues[0].reason, "Shell veto")
+        self.assertTrue(records[0].path.exists())
+
+    def test_cancellation_after_first_success_reports_only_completed_work(self):
+        records = self.records()
+        cancel = Event()
+        def recycler(path, revalidate):
+            revalidate()
+            path.rename(path.with_suffix(".recycled-fixture"))
+            cancel.set()
+        outcome = recycle_reviewed_files(records, [record.path for record in records], cancel=cancel, recycler=recycler)
+        self.assertTrue(outcome.cancelled)
+        self.assertEqual(outcome.recycled, [records[0].path])
+        self.assertTrue(records[1].path.exists())
+
+    def test_one_failure_does_not_hide_other_successful_recycles(self):
+        records = self.records()
+        def recycler(path, revalidate):
+            revalidate()
+            if path == records[0].path:
+                raise OSError("Cannot recycle first fixture")
+            path.rename(path.with_suffix(".recycled-fixture"))
+        outcome = recycle_reviewed_files(records, [record.path for record in records], recycler=recycler)
+        self.assertEqual(outcome.recycled, [records[1].path])
+        self.assertEqual([issue.path for issue in outcome.issues], [records[0].path])
+
+    @unittest.skipUnless(os.name == "nt", "Windows stream locks")
+    def test_main_and_extra_streams_remain_locked_through_shell_callback(self):
+        records = self.records()
+        path = records[0].path
+        with open(str(path) + ":metadata", "wb") as stream:
+            stream.write(b"independent extra data")
+        records[0] = capture(path)
+        def recycler(selected, revalidate):
+            with self.assertRaises(OSError):
+                selected.write_bytes(b"changed")
+            with self.assertRaises(OSError):
+                open(str(selected) + ":metadata", "wb").close()
+            revalidate()
+            selected.rename(selected.with_suffix(".recycled-fixture"))
+        outcome = recycle_reviewed_files(records, [path], recycler=recycler)
+        self.assertEqual(outcome.recycled, [path])
+        self.assertFalse(outcome.issues)
+
+    @unittest.skipUnless(os.name == "nt", "Windows named streams")
+    def test_changed_stream_layout_blocks_cleanup(self):
+        records = self.records()
+        with open(str(records[0].path) + ":new-metadata", "wb") as stream:
+            stream.write(b"new")
+        recycler = Mock()
+        outcome = recycle_reviewed_files(records, [records[0].path], recycler=recycler)
+        recycler.assert_not_called()
+        self.assertEqual(len(outcome.issues), 1)
 
 
 class CleanupTests(FileTestCase):

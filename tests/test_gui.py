@@ -17,10 +17,97 @@ from duplicate_cleaner.gui import MainWindow, STYLE
 from duplicate_cleaner.models import Issue, RecycleResult, format_bytes
 from duplicate_cleaner.scanner import scan
 from duplicate_cleaner.sessions import LoadResult, SaveResult, SessionData
+from duplicate_cleaner.similarity import scan_similar
+from tests.test_similarity import sample_image
 from tests.support import FileTestCase
 
 
 class GuiTests(FileTestCase):
+    def populate_new_session_modes(self):
+        self.file("saved-folder-a/contents.txt", b"saved folder contents")
+        self.file("saved-folder-b/renamed.txt", b"saved folder contents")
+        folder_result = scan_duplicate_folders([self.root / "saved-folder-a", self.root / "saved-folder-b"], False)
+        self.window.on_duplicate_folder_scan(folder_result)
+        next(self.window.duplicate_folder_items()).setCheckState(0, Qt.CheckState.Checked)
+        media = self.root / "saved-media"
+        media.mkdir()
+        image = sample_image()
+        self.assertTrue(image.save(str(media / "a.png")))
+        self.assertTrue(image.scaled(180, 120).save(str(media / "b.jpg"), quality=60))
+        self.window.similar_tab.on_result(scan_similar([media]))
+        self.window.similar_tab.select_group(self.window.similar_tab.result.groups[0])
+
+    def test_save_session_snapshots_all_completed_modes_and_active_workflow(self):
+        self.populate_new_session_modes()
+        self.window.workflow_tabs.setCurrentWidget(self.window.similar_tab)
+        with patch.object(QFileDialog, "getSaveFileName", return_value=(str(self.root / "all.dupsession"), "")), \
+                patch.object(self.window, "start_job") as start:
+            self.window.save_session()
+        with patch("duplicate_cleaner.gui.save_session_file") as save:
+            start.call_args.args[0]()
+        data = save.call_args.args[1]
+        self.assertEqual(data.folder_result.groups, self.window.folder_groups)
+        self.assertEqual(data.similar_result.groups, self.window.similar_tab.result.groups)
+        self.assertEqual(data.selected_folders, self.window.selected_duplicate_folders)
+        self.assertEqual(data.selected_similar, self.window.similar_tab.selected)
+        self.assertEqual(data.active_workflow, "similarity")
+        self.assertFalse(data.similar_result.images)  # Discovery caches are intentionally not sessions.
+
+    def test_save_is_available_for_folder_only_and_similar_only_results(self):
+        self.populate_new_session_modes()
+        self.window.session_available = False
+        for mode in ("folders", "similarity"):
+            self.window.folder_session_available = mode == "folders"
+            self.window.similar_tab.session_available = mode == "similarity"
+            self.window.update_actions()
+            self.assertTrue(self.window.save_session_button.isEnabled())
+            with patch.object(QFileDialog, "getSaveFileName", return_value=(str(self.root / "only.dupsession"), "")), \
+                    patch.object(self.window, "start_job") as start:
+                self.window.save_session()
+            with patch("duplicate_cleaner.gui.save_session_file") as save:
+                start.call_args.args[0]()
+            data = save.call_args.args[1]
+            self.assertFalse(data.duplicate_available)
+            self.assertFalse(data.groups)
+            self.assertEqual(data.folder_result is not None, mode == "folders")
+            self.assertEqual(data.similar_result is not None, mode == "similarity")
+
+    def test_loading_all_modes_defaults_unchecked_and_restores_checks_when_requested(self):
+        self.populate_new_session_modes()
+        folder_checks = frozenset(self.window.selected_duplicate_folders)
+        similar_checks = frozenset(self.window.similar_tab.selected)
+        data = replace(self.saved_session_data(), folder_result=scan_duplicate_folders(
+            [self.root / "saved-folder-a", self.root / "saved-folder-b"], False),
+            similar_result=self.window.similar_tab.result, selected_folders=folder_checks,
+            selected_similar=similar_checks, active_workflow="folders")
+        result = LoadResult(self.root / "all.dupsession", data, saved_selection_count=3)
+        for restore in (False, True):
+            def accept(dialog):
+                button = (next(button for button in dialog.buttons() if button.text().startswith("Restore"))
+                          if restore else dialog.defaultButton())
+                button.click()
+                return 0
+            with patch.object(QMessageBox, "exec", accept):
+                self.window.on_session_loaded(result)
+            self.assertEqual(self.window.selected_duplicate_folders, folder_checks if restore else set())
+            self.assertEqual(self.window.similar_tab.selected, similar_checks if restore else set())
+            self.assertIs(self.window.workflow_tabs.currentWidget(), self.window.folder_page)
+            self.assertTrue(self.window.folder_session_available)
+            self.assertTrue(self.window.similar_tab.session_available)
+            self.assertFalse(self.window._scan_baselines)
+
+    def test_loading_legacy_session_clears_other_modes_and_selections(self):
+        self.populate_new_session_modes()
+        result = LoadResult(self.root / "legacy.dupsession", self.saved_session_data())
+        with patch.object(QMessageBox, "exec", lambda dialog: (dialog.defaultButton().click(), 0)[1]):
+            self.window.on_session_loaded(result)
+        self.assertFalse(self.window.folder_groups)
+        self.assertFalse(self.window.selected_duplicate_folders)
+        self.assertFalse(self.window.similar_tab.result.groups)
+        self.assertFalse(self.window.similar_tab.selected)
+        self.assertFalse(self.window.folder_session_available)
+        self.assertFalse(self.window.similar_tab.session_available)
+
     def test_file_size_is_visible_on_group_line_and_stays_after_selection(self):
         group = self.window.groups[0]
         parent = self.window.tree.topLevelItem(0)
@@ -224,7 +311,7 @@ class GuiTests(FileTestCase):
 
         self.assertFalse(self.window.selected)
         self.assertEqual(self.window.type_tabs.tabText(self.window.type_tabs.currentIndex()), "All")
-        self.assertIn("all files left unchecked", self.window.status.text())
+        self.assertIn("all items left unchecked", self.window.status.text())
 
     def test_cancelling_load_preserves_current_results_and_checks(self):
         item = self.window.tree.topLevelItem(0).child(0)
@@ -640,14 +727,15 @@ class GuiTests(FileTestCase):
         position = self.window.tree.visualItemRect(item).center()
         fake_menu = Mock()
         fake_action = Mock()
-        fake_menu.addAction.side_effect = [Mock(), fake_action]
+        fake_menu.addAction.side_effect = [Mock(), fake_action, Mock()]
         with patch("duplicate_cleaner.gui.QMenu", return_value=fake_menu), \
              patch.object(self.window, "select_folder_duplicates") as select:
             self.window.show_result_menu(position)
             callback = fake_action.triggered.connect.call_args.args[0]
             callback()
         self.assertEqual([call.args[0] for call in fake_menu.addAction.call_args_list],
-                         ["Open file location", "Select this folder's duplicates (keep one copy)"])
+                         ["Open file location", "Select this folder's duplicates (keep one copy)",
+                          "Select all items in this group"])
         fake_action.setEnabled.assert_called_once_with(True)
         fake_menu.exec.assert_called_once()
         select.assert_called_once_with(item)
@@ -678,14 +766,47 @@ class GuiTests(FileTestCase):
         self.assertEqual(opened.call_args.args[0].toLocalFile().replace("/", "\\"), str(record.path.parent))
         self.assertEqual(self.window.selected, selected)
 
-    def test_context_menu_ignores_group_and_blank_rows(self):
+    def test_context_menu_selects_entire_group_including_hidden_members(self):
         self.window.show()
         self.app.processEvents()
-        with patch("duplicate_cleaner.gui.QMenu") as menu:
+        parent = self.window.tree.topLevelItem(0)
+        paths = {record.path for record in parent.data(0, Qt.ItemDataRole.UserRole).files}
+        self.select_tab("Videos")
+        self.window.select_duplicate_group(parent.child(0))
+        self.assertTrue(paths.issubset(self.window.selected))
+        self.assertTrue(all(parent.child(i).checkState(0) == Qt.CheckState.Checked for i in range(parent.childCount())))
+        self.window.clear_selection()
+        self.select_tab("All")
+        menu = QMenu(self.window)
+        def select_group(position):
+            self.assertEqual([action.text() for action in menu.actions()], ["Select all items in this group"])
+            menu.actions()[0].trigger()
+        with patch("duplicate_cleaner.gui.QMenu", return_value=menu), patch.object(menu, "exec", side_effect=select_group):
             self.window.show_result_menu(self.window.tree.visualItemRect(self.window.tree.topLevelItem(0)).center())
+        self.assertEqual(self.window.selected, paths)
+        with patch("duplicate_cleaner.gui.QMenu") as blank_menu:
             self.window.tree.collapseAll()
             self.window.show_result_menu(self.window.tree.viewport().rect().bottomLeft())
-        menu.assert_not_called()
+        blank_menu.assert_not_called()
+
+    def test_duplicate_folder_group_menu_selects_all_and_respects_busy_state(self):
+        (self.root / "empty-a").mkdir()
+        (self.root / "empty-b").mkdir()
+        self.window.on_duplicate_folder_scan(scan_duplicate_folders([self.root]))
+        self.window.workflow_tabs.setCurrentWidget(self.window.folder_page)
+        self.window.show()
+        self.app.processEvents()
+        parent = self.window.duplicate_folder_tree.topLevelItem(0)
+        menu = QMenu(self.window)
+        with patch("duplicate_cleaner.gui.QMenu", return_value=menu), \
+                patch.object(menu, "exec", side_effect=lambda position: menu.actions()[-1].trigger()):
+            self.window.show_duplicate_folder_menu(self.window.duplicate_folder_tree.visualItemRect(parent).center())
+        paths = {folder.path for folder in parent.data(0, Qt.ItemDataRole.UserRole).folders}
+        self.assertEqual(self.window.selected_duplicate_folders, paths)
+        self.window.clear_duplicate_folder_selection()
+        with patch.object(self.window, "mode_busy", return_value=True):
+            self.window.select_duplicate_folder_group(parent)
+        self.assertFalse(self.window.selected_duplicate_folders)
 
     def test_initial_tab_is_scan_location_and_filters_open_duplicate_files(self):
         window = MainWindow()

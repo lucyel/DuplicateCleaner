@@ -3,7 +3,8 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
-from duplicate_cleaner.cleanup import recycle_selected
+from duplicate_cleaner.cleanup import recycle_reviewed_files, recycle_selected
+from duplicate_cleaner.files import capture
 from duplicate_cleaner.empty_folders import recycle_empty_folders, scan_empty_folders
 from duplicate_cleaner.duplicate_folders import recycle_duplicate_folders, scan_duplicate_folders
 from duplicate_cleaner.scanner import scan
@@ -14,6 +15,17 @@ from tests.support import FileTestCase
 @unittest.skipUnless(os.name == "nt" and os.environ.get("DUPLICATE_CLEANER_RECYCLE_TEST") == "1",
                      "Set DUPLICATE_CLEANER_RECYCLE_TEST=1 for real Windows Shell tests on disposable files")
 class WindowsRecycleTests(FileTestCase):
+    def test_reviewed_similar_cleanup_recycles_different_contents_with_own_streams(self):
+        selected = self.file("reviewed-similar-fixture.jpg", b"reviewed version")
+        kept = self.file("kept-similar-fixture.png", b"different content")
+        with open(str(selected) + ":reviewed-metadata", "wb") as stream:
+            stream.write(b"metadata on the reviewed file")
+        result = recycle_reviewed_files([capture(selected), capture(kept)], [selected])
+        self.assertFalse(result.issues, result.issues)
+        self.assertEqual(result.recycled, [selected])
+        self.assertFalse(selected.exists())
+        self.assertEqual(kept.read_bytes(), b"different content")
+
     def test_real_cleanup_recycles_nonempty_folder_and_preserves_comparison(self):
         selected = self.file("selected-folder/nested/file.txt")
         kept = self.file("comparison-folder/renamed.txt")

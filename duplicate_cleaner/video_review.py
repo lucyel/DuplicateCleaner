@@ -1,8 +1,8 @@
-"""Read-only sampled-frame viewer used only by Similar files."""
+"""Sampled-frame viewer and manual selections used only by Similar files."""
 
-from PySide6.QtCore import Qt, QUrl
+from PySide6.QtCore import Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QImage
-from PySide6.QtWidgets import QComboBox, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QCheckBox, QComboBox, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
 
 from .files import ensure_current
 from .preview import ImageView
@@ -10,9 +10,13 @@ from .video_similarity import preview_frame, timestamp
 
 
 class VideoComparison(QWidget):
+    selection_changed = Signal(object, bool)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.videos, self.evidence = (), None
+        self.selected = set()
+        self.checks = []
         layout = QVBoxLayout(self)
         self.summary = QLabel()
         self.summary.setWordWrap(True)
@@ -33,6 +37,12 @@ class VideoComparison(QWidget):
             label.setTextFormat(Qt.TextFormat.PlainText)
             label.setWordWrap(True)
             column.addWidget(label)
+            check = QCheckBox("Select for recycling")
+            check.setAccessibleName(title + " selected for recycling")
+            check.setEnabled(False)
+            check.toggled.connect(lambda checked, i=index: self.selection_toggled(i, checked))
+            column.addWidget(check)
+            self.checks.append(check)
             button = QPushButton("Open video")
             button.clicked.connect(lambda checked=False, i=index: self.open_video(i))
             column.addWidget(button)
@@ -52,6 +62,19 @@ class VideoComparison(QWidget):
             self.samples.addItem(f"~{timestamp(reference.timestamps[a])} ↔ ~{timestamp(candidate.timestamps[b])} · {status}")
         self.samples.blockSignals(blocked)
         self.show_sample(0)
+        self.set_selection(self.selected)
+
+    def set_selection(self, selected):
+        self.selected = selected
+        for index, check in enumerate(self.checks):
+            blocked = check.blockSignals(True)
+            check.setEnabled(bool(self.videos))
+            check.setChecked(bool(self.videos) and self.videos[index].record.path in selected)
+            check.blockSignals(blocked)
+
+    def selection_toggled(self, index, checked):
+        if self.videos:
+            self.selection_changed.emit(self.videos[index].record.path, checked)
 
     def show_sample(self, slot):
         if not self.videos or slot < 0:
@@ -85,3 +108,4 @@ class VideoComparison(QWidget):
             view.display(QImage())
         for label in self.labels:
             label.clear()
+        self.set_selection(self.selected)
